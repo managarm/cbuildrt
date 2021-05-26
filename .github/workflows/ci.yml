@@ -1,0 +1,22 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+    build:
+        name: Build cbuildrt
+        runs-on: ubuntu-20.04
+        steps:
+          - name: Install prerequisites
+            run: |
+                rustup target add x86_64-unknown-linux-musl
+          - name: Checkout
+            uses: actions/checkout@v2
+          - name: Build using Cargo
+            run: |
+                cargo build --release --target x86_64-unknown-linux-musl
+          - name: Publish artifact
+            uses: actions/upload-artifact@v2
+            with:
+                name: cbuildrt-linux-x86_64
+                path: target/x86_64-unknown-linux-musl/release/cbuildrt
