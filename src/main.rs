@@ -101,6 +101,15 @@ fn run_init(cfg: &Config) -> ! {
     }
 
     nix::mount::mount(
+        Some(&sys::fs::read_link("/etc/resolv.conf")),
+        &concat_absolute(&cfg.rootfs, "/etc/resolv.conf"),
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .expect("failed to mount /etc/resolv.conf");
+
+    nix::mount::mount(
         None::<&str>,
         &concat_absolute(&cfg.rootfs, "/dev/pts"),
         Some("devpts"),
