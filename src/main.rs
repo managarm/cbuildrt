@@ -101,7 +101,7 @@ fn run_init(cfg: &Config) -> ! {
     }
 
     nix::mount::mount(
-        Some(&sys::fs::read_link("/etc/resolv.conf")),
+        Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
         &concat_absolute(&cfg.rootfs, "/etc/resolv.conf"),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
