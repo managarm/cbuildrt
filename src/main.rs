@@ -54,13 +54,6 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
 }
 
 fn run_init(cfg: &Config) -> ! {
-    // Create regular files in /dev such that we can bind mount the real devices later.
-    let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
-    for f in &dev_overlays {
-        File::create(concat_absolute(&cfg.rootfs, "/dev/").join(f))
-            .expect("unable to create file for device overlay");
-    }
-
     // We can now set up the remaining namespaces and perform mounts.
     nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).expect("failed to unshare()");
 
