@@ -82,6 +82,7 @@ fn run_init(cfg: &Config) -> ! {
 
     // Perform mounts of /dev, /dev/pts, /dev/shm, /run and /tmp.
 
+    let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
     for f in dev_overlays {
         nix::mount::mount(
             Some(&Path::new("/dev/").join(f)),
