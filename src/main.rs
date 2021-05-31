@@ -163,6 +163,16 @@ fn run_init(cfg: &Config) -> ! {
     // (We cannot use Rust's high-level API since we need to reap orphans.)
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
+            // Reset PATH to the default value
+            if cfg.user.uid == 0 {
+                std::env::set_var(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
+            } else {
+                std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+            }
+
             let exec_result = nix::unistd::execvp(
                 &CString::new(cfg.process.args[0].as_str()).unwrap(),
                 &cfg.process
