@@ -80,7 +80,7 @@ fn run_init(cfg: &Config) -> ! {
     )
     .expect("failed to make rootfs read-only");
 
-    // Perform mounts of /dev, /dev/pts, /dev/shm, /run and /tmp.
+    // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp and /proc.
 
     let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
     for f in dev_overlays {
@@ -138,6 +138,15 @@ fn run_init(cfg: &Config) -> ! {
         None::<&str>,
     )
     .expect("failed to mount /tmp");
+
+    nix::mount::mount(
+        None::<&str>,
+        &concat_absolute(&cfg.rootfs, "/proc"),
+        Some("proc"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("failed to mount /proc");
 
     // Perform bind mounts requested by user.
     for bm in &cfg.bind_mounts {
