@@ -34,6 +34,7 @@ jobs:
                 path: linux-x86_64
           - name: Prepare assets
             run: |
+                chmod +x linux-x86_64/cbuildrt
                 tar -cf cbuildrt-linux-x86_64-static.tar -C linux-x86_64 cbuildrt
           - name: Do release
             uses: softprops/action-gh-release@v1
