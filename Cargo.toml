@@ -1,6 +1,6 @@
 [package]
 name = "cbuildrt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Containerized Build Runtime"
 license = "MIT"
 authors = ["The Managarm Project <info@managarm.org>"]
