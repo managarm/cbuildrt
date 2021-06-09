@@ -1,3 +1,4 @@
+use clap::crate_version;
 use libc::{gid_t, uid_t};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
@@ -35,6 +36,7 @@ struct Config {
 //       for now, we assume that xbstrap passes sane values.
 fn make_config_from_cli() -> Config {
     let matches = clap::App::new("cbuildrt")
+        .version(crate_version!())
         .arg(
             clap::Arg::with_name("cbuild-json")
                 .help("cbuild.json file")
