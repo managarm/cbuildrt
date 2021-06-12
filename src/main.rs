@@ -71,13 +71,18 @@ fn run_init(cfg: &Config) -> ! {
     )
     .expect("failed to bind mount rootfs to itself");
 
+    // The fs might be mounted as nosuid/nodev and we will not have permissions
+    // to strip these mount options.
+    // Instead of parsing the current mount table, just set these flags unconditionally for now.
     nix::mount::mount(
         Some(&cfg.rootfs),
         &cfg.rootfs,
         None::<&str>,
         nix::mount::MsFlags::MS_REMOUNT
             | nix::mount::MsFlags::MS_BIND
-            | nix::mount::MsFlags::MS_RDONLY,
+            | nix::mount::MsFlags::MS_RDONLY
+            | nix::mount::MsFlags::MS_NOSUID
+            | nix::mount::MsFlags::MS_NODEV,
         None::<&str>,
     )
     .expect("failed to make rootfs read-only");
