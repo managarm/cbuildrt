@@ -1,5 +1,7 @@
 use clap::crate_version;
 use libc::{gid_t, uid_t};
+use nix::fcntl::{flock, open, FlockArg, OFlag};
+use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs::File;
@@ -220,6 +222,22 @@ fn run_init(cfg: &Config) -> ! {
 
 fn main() {
     let cfg = make_config_from_cli();
+
+    let lockfile_path = cfg
+        .rootfs
+        .parent()
+        .and_then(|p| Some(p.join(cfg.rootfs.file_name()?)))
+        .map(|p| p.with_extension("cbrt_lock"))
+        .expect("couldn't construct lockfile path");
+
+    let root_dir = open(
+        &lockfile_path,
+        OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
+        Mode::from_bits(0o444).unwrap(),
+    )
+    .expect("couldn't open rootfs for locking");
+
+    flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
 
     let euid = nix::unistd::geteuid();
     let egid = nix::unistd::getegid();
