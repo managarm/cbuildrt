@@ -199,7 +199,7 @@ fn run_init(cfg: &Config) -> ! {
                     .map(|a| CString::new(a.as_str()).unwrap())
                     .collect::<Vec<_>>(),
             );
-            println!("error when executing program: {}", exec_result.unwrap_err());
+            eprintln!("error when executing program: {}", exec_result.unwrap_err());
             exit(1);
         }
         Ok(nix::unistd::ForkResult::Parent { child: child_pid }) => {
@@ -209,7 +209,7 @@ fn run_init(cfg: &Config) -> ! {
                 if let nix::sys::wait::WaitStatus::Exited(pid, code) = child_status {
                     if pid == child_pid {
                         if code != 0 {
-                            println!("child returned non-zero exit code");
+                            eprintln!("child returned non-zero exit code");
                         }
                         exit(code);
                     }
@@ -269,7 +269,7 @@ fn main() {
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => run_init(&cfg),
         Ok(nix::unistd::ForkResult::Parent { child: init_pid }) => {
-            println!("PID init is {} (outside the namespace)", init_pid);
+            eprintln!("PID init is {} (outside the namespace)", init_pid);
 
             // Wait for init to terminate.
             let init_status =
