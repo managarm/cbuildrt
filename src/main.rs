@@ -31,6 +31,8 @@ struct Config {
     rootfs: PathBuf,
     user: User,
     process: Process,
+    #[serde(default)]
+    isolate_network: bool,
     bind_mounts: Vec<BindMount>,
 }
 
@@ -59,7 +61,11 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
 
 fn run_init(cfg: &Config) -> ! {
     // We can now set up the remaining namespaces and perform mounts.
-    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).expect("failed to unshare()");
+    let mut clone_flags = nix::sched::CloneFlags::CLONE_NEWNS;
+    if cfg.isolate_network {
+        clone_flags |= nix::sched::CloneFlags::CLONE_NEWNET;
+    }
+    nix::sched::unshare(clone_flags).expect("failed to unshare()");
 
     // First, we need to get a read-only rootfs.
     // Mounting with MS_BIND ignored MS_RDONLY, but MS_REMOUNT respects it.
@@ -103,14 +109,16 @@ fn run_init(cfg: &Config) -> ! {
         .expect("failed to mount device");
     }
 
-    nix::mount::mount(
-        Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
-        &concat_absolute(&cfg.rootfs, "/etc/resolv.conf"),
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .expect("failed to mount /etc/resolv.conf");
+    if !cfg.isolate_network {
+        nix::mount::mount(
+            Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
+            &concat_absolute(&cfg.rootfs, "/etc/resolv.conf"),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to mount /etc/resolv.conf");
+    }
 
     nix::mount::mount(
         None::<&str>,
