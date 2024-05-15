@@ -60,6 +60,17 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
 }
 
 fn run_init(cfg: &Config) -> ! {
+    match std::os::unix::fs::symlink(
+        "/proc/self/fd",
+        &concat_absolute(&cfg.rootfs, "/dev/fd")
+    ) {
+        Ok(_) => {},
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
+        Err(err) => {
+            panic!("failed to symlink /dev/fd: {}", err)
+        }
+    }
+
     // We can now set up the remaining namespaces and perform mounts.
     let mut clone_flags = nix::sched::CloneFlags::CLONE_NEWNS;
     if cfg.isolate_network {
