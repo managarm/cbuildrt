@@ -5,6 +5,7 @@ use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs::File;
+use std::mem::forget;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -26,9 +27,16 @@ struct Process {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RootFs {
+    Path(PathBuf),
+    Overlay { layers: Vec<PathBuf> },
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Config {
-    rootfs: PathBuf,
+    rootfs: RootFs,
     user: User,
     process: Process,
     #[serde(default)]
@@ -59,7 +67,7 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
     lhs.as_ref().join(rhs.as_ref().strip_prefix("/").unwrap())
 }
 
-fn run_init(cfg: &Config) -> ! {
+fn run_init(cfg: &Config, rootfs: &Path) -> ! {
     // We can now set up the remaining namespaces and perform mounts.
     let mut clone_flags = nix::sched::CloneFlags::CLONE_NEWNS;
     if cfg.isolate_network {
@@ -67,33 +75,60 @@ fn run_init(cfg: &Config) -> ! {
     }
     nix::sched::unshare(clone_flags).expect("failed to unshare()");
 
-    // First, we need to get a read-only rootfs.
-    // Mounting with MS_BIND ignored MS_RDONLY, but MS_REMOUNT respects it.
+    if let RootFs::Overlay { layers } = &cfg.rootfs {
+        let mount = rustix::mount::fsopen("overlay", rustix::mount::FsOpenFlags::FSOPEN_CLOEXEC)
+            .expect("failed to open overlay filesystem");
 
-    nix::mount::mount(
-        Some(&cfg.rootfs),
-        &cfg.rootfs,
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .expect("failed to bind mount rootfs to itself");
+        for path in layers {
+            rustix::mount::fsconfig_set_string(&mount, "lowerdir+", path)
+                .expect("failed to set overlay lowerdir option");
+        }
 
-    // The fs might be mounted as nosuid/nodev and we will not have permissions
-    // to strip these mount options.
-    // Instead of parsing the current mount table, just set these flags unconditionally for now.
-    nix::mount::mount(
-        Some(&cfg.rootfs),
-        &cfg.rootfs,
-        None::<&str>,
-        nix::mount::MsFlags::MS_REMOUNT
-            | nix::mount::MsFlags::MS_BIND
-            | nix::mount::MsFlags::MS_RDONLY
-            | nix::mount::MsFlags::MS_NOSUID
-            | nix::mount::MsFlags::MS_NODEV,
-        None::<&str>,
-    )
-    .expect("failed to make rootfs read-only");
+        rustix::mount::fsconfig_create(&mount).expect("failed to create overlay filesystem");
+
+        let mount = rustix::mount::fsmount(
+            &mount,
+            rustix::mount::FsMountFlags::FSMOUNT_CLOEXEC,
+            rustix::mount::MountAttrFlags::empty(),
+        )
+        .expect("failed to mount overlay filesystem");
+
+        rustix::mount::move_mount(
+            &mount,
+            "",
+            rustix::fs::CWD,
+            rootfs,
+            rustix::mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .expect("failed to move overlay filesystem to rootfs");
+    } else {
+        // First, we need to get a read-only rootfs.
+        // Mounting with MS_BIND ignored MS_RDONLY, but MS_REMOUNT respects it.
+        nix::mount::mount(
+            Some(rootfs),
+            rootfs,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to bind mount rootfs to itself");
+
+        // The fs might be mounted as nosuid/nodev and we will not have permissions
+        // to strip these mount options.
+        // Instead of parsing the current mount table, just set these flags unconditionally for now.
+        nix::mount::mount(
+            Some(rootfs),
+            rootfs,
+            None::<&str>,
+            nix::mount::MsFlags::MS_REMOUNT
+                | nix::mount::MsFlags::MS_BIND
+                | nix::mount::MsFlags::MS_RDONLY
+                | nix::mount::MsFlags::MS_NOSUID
+                | nix::mount::MsFlags::MS_NODEV,
+            None::<&str>,
+        )
+        .expect("failed to make rootfs read-only");
+    }
 
     // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp and /proc.
 
@@ -101,7 +136,7 @@ fn run_init(cfg: &Config) -> ! {
     for f in dev_overlays {
         nix::mount::mount(
             Some(&Path::new("/dev/").join(f)),
-            &concat_absolute(&cfg.rootfs, "/dev/").join(f),
+            &concat_absolute(rootfs, "/dev/").join(f),
             None::<&str>,
             nix::mount::MsFlags::MS_BIND,
             None::<&str>,
@@ -112,7 +147,7 @@ fn run_init(cfg: &Config) -> ! {
     if !cfg.isolate_network {
         nix::mount::mount(
             Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
-            &concat_absolute(&cfg.rootfs, "/etc/resolv.conf"),
+            &concat_absolute(rootfs, "/etc/resolv.conf"),
             None::<&str>,
             nix::mount::MsFlags::MS_BIND,
             None::<&str>,
@@ -122,7 +157,7 @@ fn run_init(cfg: &Config) -> ! {
 
     nix::mount::mount(
         None::<&str>,
-        &concat_absolute(&cfg.rootfs, "/dev/pts"),
+        &concat_absolute(rootfs, "/dev/pts"),
         Some("devpts"),
         nix::mount::MsFlags::empty(),
         None::<&str>,
@@ -131,7 +166,7 @@ fn run_init(cfg: &Config) -> ! {
 
     nix::mount::mount(
         None::<&str>,
-        &concat_absolute(&cfg.rootfs, "/dev/shm"),
+        &concat_absolute(rootfs, "/dev/shm"),
         Some("tmpfs"),
         nix::mount::MsFlags::empty(),
         None::<&str>,
@@ -140,7 +175,7 @@ fn run_init(cfg: &Config) -> ! {
 
     nix::mount::mount(
         None::<&str>,
-        &concat_absolute(&cfg.rootfs, "/run"),
+        &concat_absolute(rootfs, "/run"),
         Some("tmpfs"),
         nix::mount::MsFlags::empty(),
         None::<&str>,
@@ -149,7 +184,7 @@ fn run_init(cfg: &Config) -> ! {
 
     nix::mount::mount(
         None::<&str>,
-        &concat_absolute(&cfg.rootfs, "/tmp"),
+        &concat_absolute(rootfs, "/tmp"),
         Some("tmpfs"),
         nix::mount::MsFlags::empty(),
         None::<&str>,
@@ -158,7 +193,7 @@ fn run_init(cfg: &Config) -> ! {
 
     nix::mount::mount(
         None::<&str>,
-        &concat_absolute(&cfg.rootfs, "/proc"),
+        &concat_absolute(rootfs, "/proc"),
         Some("proc"),
         nix::mount::MsFlags::empty(),
         None::<&str>,
@@ -169,7 +204,7 @@ fn run_init(cfg: &Config) -> ! {
     for bm in &cfg.bind_mounts {
         nix::mount::mount(
             Some(&bm.source),
-            &concat_absolute(&cfg.rootfs, &bm.destination),
+            &concat_absolute(rootfs, &bm.destination),
             None::<&str>,
             nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
             None::<&str>,
@@ -178,7 +213,7 @@ fn run_init(cfg: &Config) -> ! {
     }
 
     // chroot() and change the current directory to /.
-    nix::unistd::chroot(&cfg.rootfs).expect("failed to chroot()");
+    nix::unistd::chroot(rootfs).expect("failed to chroot()");
     nix::unistd::chdir("/").expect("failed to chdir() to root directory");
 
     // TODO: We could drop privileges here.
@@ -231,21 +266,29 @@ fn run_init(cfg: &Config) -> ! {
 fn main() {
     let cfg = make_config_from_cli();
 
-    let lockfile_path = cfg
-        .rootfs
-        .parent()
-        .and_then(|p| Some(p.join(cfg.rootfs.file_name()?)))
-        .map(|p| p.with_extension("cbrt_lock"))
-        .expect("couldn't construct lockfile path");
+    let merged_overlay =
+        tempfile::tempdir().expect("failed to create temporary directory for merged overlay");
 
-    let root_dir = open(
-        &lockfile_path,
-        OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
-        Mode::from_bits(0o444).unwrap(),
-    )
-    .expect("couldn't open rootfs for locking");
+    let rootfs = match &cfg.rootfs {
+        RootFs::Path(path) => {
+            let lockfile_path = path
+                .parent()
+                .and_then(|p| Some(p.join(path.file_name()?)))
+                .map(|p| p.with_extension("cbrt_lock"))
+                .expect("couldn't construct lockfile path");
 
-    flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
+            let root_dir = open(
+                &lockfile_path,
+                OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
+                Mode::from_bits(0o444).unwrap(),
+            )
+            .expect("couldn't open rootfs for locking");
+
+            flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
+            path.to_path_buf()
+        }
+        RootFs::Overlay { .. } => merged_overlay.path().to_path_buf(),
+    };
 
     let euid = nix::unistd::geteuid();
     let egid = nix::unistd::getegid();
@@ -275,7 +318,10 @@ fn main() {
     // fork() and run init in the child.
     // The parent waits for the child to terminate.
     match unsafe { nix::unistd::fork() } {
-        Ok(nix::unistd::ForkResult::Child) => run_init(&cfg),
+        Ok(nix::unistd::ForkResult::Child) => {
+            forget(merged_overlay);
+            run_init(&cfg, &rootfs);
+        }
         Ok(nix::unistd::ForkResult::Parent { child: init_pid }) => {
             eprintln!("PID init is {} (outside the namespace)", init_pid);
 
@@ -286,6 +332,8 @@ fn main() {
                 nix::sys::wait::WaitStatus::Exited(_, code) => code,
                 _ => panic!("waiting for init returned {:?}", init_status),
             };
+
+            drop(merged_overlay);
             exit(init_code);
         }
         Err(_) => panic!("failed to fork from cbuildrt"),
