@@ -157,7 +157,7 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
             .expect("failed to make rootfs read-only");
         }
 
-        // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp and /proc.
+        // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp, /var/tmp, /sys, and /proc.
 
         let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
         for f in dev_overlays {
@@ -226,6 +226,37 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
             None::<&str>,
         )
         .expect("failed to mount /proc");
+
+        // Mount /var/tmp as tmpfs.
+        // TODO: Technically /var/tmp is supposed to survive boots.
+        nix::mount::mount(
+            None::<&str>,
+            &concat_absolute(rootfs, "/var/tmp"),
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .expect("failed to mount /var/tmp");
+
+        // Mount /sys via recursive bind + slave.
+        // This is needed such that the container can access /sys/fs/* and similar.
+        nix::mount::mount(
+            Some(Path::new("/sys")),
+            &concat_absolute(rootfs, "/sys"),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .expect("failed to bind mount /sys");
+
+        nix::mount::mount(
+            None::<&str>,
+            &concat_absolute(rootfs, "/sys"),
+            None::<&str>,
+            nix::mount::MsFlags::MS_SLAVE | nix::mount::MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .expect("failed to make /sys slave");
     }
 
     // Perform bind mounts requested by user.
