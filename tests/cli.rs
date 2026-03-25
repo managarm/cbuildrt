@@ -47,6 +47,25 @@ fn run_echo() {
 }
 
 #[test]
+fn auto_subuid_subgid() {
+    let config = serde_json::json!({
+        "user": { "uid": 0, "gid": 0 },
+        "process": { "args": ["/usr/bin/id"] },
+        "bindMounts": [],
+        "subUid": { "auto": true, "self": 0 },
+        "subGid": { "auto": true, "self": 0 },
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg(f.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("uid=0(root) gid=0(root)"));
+}
+
+#[test]
 fn custom_environ() {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();

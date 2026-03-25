@@ -2,6 +2,7 @@ use clap::crate_version;
 use libc::{gid_t, uid_t};
 use nix::fcntl::{flock, open, FlockArg, OFlag};
 use nix::sys::stat::Mode;
+use rustix::fd::AsFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -37,7 +38,20 @@ enum RootFs {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct SubIdRange {
+    #[serde(default)]
+    auto: bool,
+    #[serde(default)]
+    start: u64,
+    #[serde(default)]
+    count: u64,
+    #[serde(rename = "self")]
+    self_id: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Config {
     // If no rootfs is passed, we are running in namespace only mode.
     // That is, we will still enter namespace but not chroot().
@@ -48,6 +62,10 @@ struct Config {
     #[serde(default)]
     isolate_network: bool,
     bind_mounts: Vec<BindMount>,
+    #[serde(default)]
+    sub_uid: Option<SubIdRange>,
+    #[serde(default)]
+    sub_gid: Option<SubIdRange>,
 }
 
 // TODO: This function does not really perform error checking;
@@ -280,6 +298,157 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
     };
 }
 
+fn setup_userns_direct(cfg: &Config, euid: nix::unistd::Uid, egid: nix::unistd::Gid) {
+    // Write the uid_map and gid_map files. Linux demands that we write setgroups first
+    // (otherwise, we need to be root in the outer namespace).
+    std::fs::write("/proc/self/setgroups", "deny").expect("unable to write setgroups file");
+
+    std::fs::write("/proc/self/uid_map", format!("{} {} 1", cfg.user.uid, euid))
+        .expect("unable to write uid_map file");
+    std::fs::write("/proc/self/gid_map", format!("{} {} 1", cfg.user.gid, egid))
+        .expect("unable to write gid_map file");
+}
+
+fn setup_userns_with_helper(sock: rustix::fd::BorrowedFd) {
+    // Signal the helper that we have unshare()d.
+    rustix::net::send(sock, &[1u8], rustix::net::SendFlags::empty())
+        .expect("failed to signal helper");
+
+    // Wait for helper to finish setting up mappings.
+    let mut done = [0u8; 1];
+    let (_, n) = rustix::net::recv(sock, &mut done, rustix::net::RecvFlags::empty())
+        .expect("failed to read from helper");
+    if n == 0 {
+        panic!("helper closed socket without signaling completion");
+    }
+}
+
+fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {
+    let content =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 && parts[0] == username {
+            let start: u64 = parts[1]
+                .parse()
+                .expect("invalid start in subordinate ID file");
+            let count: u64 = parts[2]
+                .parse()
+                .expect("invalid count in subordinate ID file");
+            return (start, count);
+        }
+    }
+    panic!("no entry for user '{}' in {}", username, path);
+}
+
+fn resolve_id_range(range: &SubIdRange, file: &str) -> (u64, u64) {
+    if range.auto {
+        let euid = nix::unistd::geteuid();
+        let user = nix::unistd::User::from_uid(euid)
+            .expect("failed to look up user")
+            .unwrap_or_else(|| panic!("no passwd entry for uid {}", euid));
+        parse_subordinate_file(file, &user.name)
+    } else {
+        (range.start, range.count)
+    }
+}
+
+// Build setuidmap/setgidmap args to map [0, sub_count) inside userns
+// to [sub_start, sub_start + sub_count) outside userns,
+// except for self_id which is mapped to host_self_id.
+fn build_id_mapping_args(
+    self_id: u64,
+    host_self_id: u64,
+    sub_start: u64,
+    sub_count: u64,
+) -> Vec<(u64, u64, u64)> {
+    let mut mappings = vec![(self_id, host_self_id, 1)];
+    // Map part of [0, sub_count) that is below self_id.
+    if self_id > 0 {
+        if self_id < sub_count {
+            mappings.push((0, sub_start, self_id));
+        } else {
+            mappings.push((0, sub_start, sub_count));
+        }
+    }
+    // Map part of [0, sub_count) that is at or above (self_id + 1).
+    if self_id + 1 < sub_count {
+        mappings.push((
+            self_id + 1,
+            sub_start + self_id + 1,
+            sub_count - (self_id + 1),
+        ));
+    }
+
+    mappings
+}
+
+fn run_userns_helper(
+    euid: nix::unistd::Uid,
+    egid: nix::unistd::Gid,
+    subuid: (u64, u64),
+    subgid: (u64, u64),
+    self_uid: u64,
+    self_gid: u64,
+    main_pid: nix::unistd::Pid,
+    sock: rustix::fd::OwnedFd,
+) -> ! {
+    // Wait for the main process to signal that it has unshared.
+    let mut ready = [0u8; 1];
+    let (_, n) = rustix::net::recv(&sock, &mut ready, rustix::net::RecvFlags::empty())
+        .expect("failed to read from main process");
+    if n == 0 {
+        exit(1);
+    }
+
+    let uid_mappings = build_id_mapping_args(self_uid, euid.as_raw().into(), subuid.0, subuid.1);
+    let mut cmd = std::process::Command::new("newuidmap");
+    cmd.arg(main_pid.as_raw().to_string());
+    for (inner, outer, count) in &uid_mappings {
+        cmd.args([inner.to_string(), outer.to_string(), count.to_string()]);
+    }
+    let status = cmd.status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            if !s.success() {
+                eprintln!("newuidmap failed with exit code {:?}", s.code());
+                exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to run newuidmap: {}", e);
+            exit(1);
+        }
+    }
+
+    let gid_mappings = build_id_mapping_args(self_gid, egid.as_raw().into(), subgid.0, subgid.1);
+    let mut cmd = std::process::Command::new("newgidmap");
+    cmd.arg(main_pid.as_raw().to_string());
+    for (inner, outer, count) in &gid_mappings {
+        cmd.args([inner.to_string(), outer.to_string(), count.to_string()]);
+    }
+    let status = cmd.status();
+    match status {
+        Ok(s) => {
+            if !s.success() {
+                eprintln!("newgidmap failed with exit code {:?}", s.code());
+                exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to run newgidmap: {}", e);
+            exit(1);
+        }
+    }
+
+    // Signal the main process that mappings are done.
+    rustix::net::send(&sock, &[1u8], rustix::net::SendFlags::empty())
+        .expect("failed to signal main process");
+
+    exit(0);
+}
+
 fn main() {
     let cfg = make_config_from_cli();
 
@@ -311,6 +480,47 @@ fn main() {
     let euid = nix::unistd::geteuid();
     let egid = nix::unistd::getegid();
 
+    // Launch a helper process to run set{uid,gid}map.
+    let (helper_pid, sock_main) =
+        if let (Some(sub_uid), Some(sub_gid)) = (&cfg.sub_uid, &cfg.sub_gid) {
+            let resolved_subuid = resolve_id_range(sub_uid, "/etc/subuid");
+            let resolved_subgid = resolve_id_range(sub_gid, "/etc/subgid");
+
+            // Set up socketpair for helper synchronization if using subordinate IDs.
+            let (sock_main, sock_helper) = rustix::net::socketpair(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::SEQPACKET,
+                rustix::net::SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("failed to create socketpair for helper sync");
+
+            let main_pid = nix::unistd::getpid();
+            match unsafe { nix::unistd::fork() } {
+                Ok(nix::unistd::ForkResult::Child) => {
+                    drop(sock_main);
+                    forget(merged_overlay);
+                    run_userns_helper(
+                        euid,
+                        egid,
+                        resolved_subuid,
+                        resolved_subgid,
+                        sub_uid.self_id,
+                        sub_gid.self_id,
+                        main_pid,
+                        sock_helper,
+                    );
+                }
+                Ok(nix::unistd::ForkResult::Parent { child }) => {
+                    drop(sock_helper);
+                    (Some(child), Some(sock_main))
+                }
+                Err(_) => panic!("failed to fork helper for ID mapping"),
+            }
+        } else {
+            (None, None)
+        };
+
     // Enter the user namespace and let children enter a new PID namespace.
     // We cannot do mounts in this process yet, as this the process itself
     // is not moved to the new PID namespace.
@@ -319,15 +529,16 @@ fn main() {
     )
     .expect("failed to unshare()");
 
-    // Write the uid_map and gid_map files. Linux demands that we write setgroups first
-    // (otherwise, we need to be root in the outer namespace).
-
-    std::fs::write("/proc/self/setgroups", "deny").expect("unable to write setgroups file");
-
-    std::fs::write("/proc/self/uid_map", format!("{} {} 1", cfg.user.uid, euid))
-        .expect("unable to write uid_map file");
-    std::fs::write("/proc/self/gid_map", format!("{} {} 1", cfg.user.gid, egid))
-        .expect("unable to write gid_map file");
+    if cfg.sub_uid.is_some() && cfg.sub_gid.is_some() {
+        setup_userns_with_helper(sock_main.unwrap().as_fd());
+        nix::sys::wait::waitpid(
+            helper_pid.expect("set{uid,gid}map helper PID must be known"),
+            None,
+        )
+        .expect("failed to wait for helper");
+    } else {
+        setup_userns_direct(&cfg, euid, egid);
+    }
 
     // Change user IDs.
     nix::unistd::setuid(nix::unistd::Uid::from_raw(cfg.user.uid)).expect("failed to set UID");
