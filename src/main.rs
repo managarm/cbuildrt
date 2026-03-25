@@ -3,6 +3,7 @@ use libc::{gid_t, uid_t};
 use nix::fcntl::{flock, open, FlockArg, OFlag};
 use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::mem::forget;
@@ -24,6 +25,8 @@ struct User {
 #[derive(Serialize, Deserialize)]
 struct Process {
     args: Vec<String>,
+    #[serde(default)]
+    environ: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,6 +244,11 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
                 );
             } else {
                 std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+            }
+
+            // Apply user-specified environment variables.
+            for (key, value) in &cfg.process.environ {
+                std::env::set_var(key, value);
             }
 
             let exec_result = nix::unistd::execvp(
