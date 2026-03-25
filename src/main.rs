@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
-use std::mem::forget;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -34,7 +33,13 @@ struct Process {
 #[serde(untagged)]
 enum RootFs {
     Path(PathBuf),
-    Overlay { layers: Vec<PathBuf> },
+    Overlay {
+        layers: Vec<PathBuf>,
+        #[serde(default, rename = "withUpper")]
+        with_upper: bool,
+        #[serde(default, rename = "extractUpper")]
+        extract_upper: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,11 +73,19 @@ struct Config {
     sub_gid: Option<SubIdRange>,
 }
 
+// Returns the config and the workspace directory (if one is passed).
 // TODO: This function does not really perform error checking;
 //       for now, we assume that xbstrap passes sane values.
-fn make_config_from_cli() -> Config {
+fn make_config_from_cli() -> (Config, Option<PathBuf>) {
     let matches = clap::App::new("cbuildrt")
         .version(crate_version!())
+        .arg(
+            clap::Arg::with_name("workspace")
+                .long("workspace")
+                .value_name("DIR")
+                .help("Directory to store cbuildrt's data (such as overlayfs layers)")
+                .takes_value(true),
+        )
         .arg(
             clap::Arg::with_name("cbuild-json")
                 .help("cbuild.json file")
@@ -80,10 +93,13 @@ fn make_config_from_cli() -> Config {
         )
         .get_matches();
 
+    let workspace = matches.value_of("workspace").map(PathBuf::from);
+
     let cfg_f =
         File::open(matches.value_of("cbuild-json").unwrap()).expect("unable to open cbuild.json");
 
-    serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json")
+    let cfg = serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json");
+    (cfg, workspace)
 }
 
 // Concatenates lhs and rhs as-if the rhs was a relative path.
@@ -91,7 +107,62 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
     lhs.as_ref().join(rhs.as_ref().strip_prefix("/").unwrap())
 }
 
-fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
+fn resolve_tar_layer(workspace: Option<&Path>, path: &Path) -> PathBuf {
+    let ext = path.extension().and_then(|e| e.to_str());
+    if ext != Some("tar") {
+        return path.to_path_buf();
+    }
+
+    let stem = path
+        .file_stem()
+        .expect("filename of tar lower layer has empty prefix");
+
+    let workspace =
+        workspace.expect("--workspace is required when an overlay uses tar lower layers");
+    let layers_root = workspace.join("layers");
+
+    // If the tar layer is already extracted, re-use the extracted version.
+    let extracted_dir = layers_root.join(stem);
+    if extracted_dir.exists() {
+        return extracted_dir;
+    }
+
+    // Extract into a staging directory.
+    std::fs::create_dir_all(&layers_root).expect("failed to create layer cache directory");
+    let staging = tempfile::Builder::new()
+        .prefix(".tmp-")
+        .tempdir_in(&layers_root)
+        .expect("failed to create staging dir for tar layer extraction");
+
+    let tar_file = File::open(path).expect("failed to open tar layer");
+    let mut archive = tar::Archive::new(tar_file);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive
+        .unpack(staging.path())
+        .expect("failed to extract tar layer");
+
+    // Rename to the final directory name.
+    let staging_path = staging.keep();
+    std::fs::rename(&staging_path, &extracted_dir)
+        .expect("failed to move extracted tar layer into cache");
+
+    extracted_dir
+}
+
+fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> ! {
+    // Derive the rootfs path.
+    let rootfs_owned: Option<PathBuf> = match &cfg.rootfs {
+        Some(RootFs::Path(path)) => Some(path.clone()),
+        Some(RootFs::Overlay { .. }) => {
+            let merged = run_dir.unwrap().join("merged");
+            std::fs::create_dir(&merged).expect("failed to create overlay merged dir");
+            Some(merged)
+        }
+        None => None,
+    };
+    let rootfs = rootfs_owned.as_deref();
+
     // We can now set up the remaining namespaces and perform mounts.
     let mut clone_flags = nix::sched::CloneFlags::CLONE_NEWNS;
     if cfg.isolate_network {
@@ -101,14 +172,35 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
 
     // Skip rootfs setup if we are running in namespace only mode.
     if let Some(rootfs) = rootfs {
-        if let Some(RootFs::Overlay { layers }) = &cfg.rootfs {
+        if let Some(RootFs::Overlay {
+            layers, with_upper, ..
+        }) = &cfg.rootfs
+        {
+            let resolved_layers: Vec<PathBuf> = layers
+                .iter()
+                .map(|p| resolve_tar_layer(workspace, p))
+                .collect();
+
             let mount =
                 rustix::mount::fsopen("overlay", rustix::mount::FsOpenFlags::FSOPEN_CLOEXEC)
                     .expect("failed to open overlay filesystem");
-
-            for path in layers {
+            for path in &resolved_layers {
                 rustix::mount::fsconfig_set_string(&mount, "lowerdir+", path)
                     .expect("failed to set overlay lowerdir option");
+            }
+            if *with_upper {
+                let run_dir =
+                    run_dir.expect("withUpper is set but no overlay tempdir was provided");
+                let upper = run_dir.join("upper");
+                let work = run_dir.join("work");
+                std::fs::create_dir(&upper).expect("failed to create overlay upper dir");
+                std::fs::create_dir(&work).expect("failed to create overlay work dir");
+                rustix::mount::fsconfig_set_string(&mount, "upperdir", &upper)
+                    .expect("failed to set overlay upperdir option");
+                rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
+                    .expect("failed to set overlay workdir option");
+                rustix::mount::fsconfig_set_flag(&mount, "userxattr")
+                    .expect("failed to set overlay userxattr option");
             }
 
             rustix::mount::fsconfig_create(&mount).expect("failed to create overlay filesystem");
@@ -271,12 +363,6 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
         .expect("failed to perform bind mount");
     }
 
-    if let Some(rootfs) = rootfs {
-        // chroot() and change the current directory to /.
-        nix::unistd::chroot(rootfs).expect("failed to chroot()");
-        nix::unistd::chdir("/").expect("failed to chdir() to root directory");
-    }
-
     // TODO: We could drop privileges here.
     //       (However, cbuildrt does not really protect against malicious sandbox escapes.)
 
@@ -285,6 +371,18 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
     // (We cannot use Rust's high-level API since we need to reap orphans.)
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
+            if let Some(rootfs) = rootfs {
+                nix::unistd::chroot(rootfs).expect("failed to chroot()");
+                nix::unistd::chdir("/").expect("failed to chdir() to root directory");
+            }
+
+            // setuid/setgid in the child only such that the init process can do cleanup as root.
+            // setgid before setuid since setuid drops capabilities.
+            nix::unistd::setgid(nix::unistd::Gid::from_raw(cfg.user.gid))
+                .expect("failed to set GID");
+            nix::unistd::setuid(nix::unistd::Uid::from_raw(cfg.user.uid))
+                .expect("failed to set UID");
+
             // Reset PATH to the default value
             if cfg.user.uid == 0 {
                 std::env::set_var(
@@ -312,18 +410,43 @@ fn run_init(cfg: &Config, rootfs: Option<&Path>) -> ! {
             exit(1);
         }
         Ok(nix::unistd::ForkResult::Parent { child: child_pid }) => {
+            let child_exit_code;
             loop {
                 // Now, let's wait for the child to terminate.
                 let child_status = nix::sys::wait::wait().expect("failed to wait for children");
                 if let nix::sys::wait::WaitStatus::Exited(pid, code) = child_status {
                     if pid == child_pid {
-                        if code != 0 {
-                            eprintln!("child returned non-zero exit code");
-                        }
-                        exit(code);
+                        child_exit_code = code;
+                        break;
                     }
                 }
             }
+
+            // If the command succeeded, extract the upper layer as a tar.
+            if child_exit_code == 0 {
+                if let Some(RootFs::Overlay {
+                    with_upper: true,
+                    extract_upper: Some(dest),
+                    ..
+                }) = &cfg.rootfs
+                {
+                    let upper = run_dir
+                        .expect("extractUpper is set but no overlay tempdir was provided")
+                        .join("upper");
+                    let tar_file = File::create(dest).expect("failed to create output tar file");
+                    let mut builder = tar::Builder::new(tar_file);
+                    builder.follow_symlinks(false);
+                    builder
+                        .append_dir_all(".", upper)
+                        .expect("failed to write upper layer to tar");
+                    builder.finish().expect("failed to finalize tar archive");
+                }
+            }
+
+            if child_exit_code != 0 {
+                eprintln!("child returned non-zero exit code");
+            }
+            exit(child_exit_code);
         }
         Err(_) => panic!("failed to fork from init"),
     };
@@ -481,32 +604,24 @@ fn run_userns_helper(
 }
 
 fn main() {
-    let cfg = make_config_from_cli();
+    let (cfg, workspace) = make_config_from_cli();
 
-    let merged_overlay =
-        tempfile::tempdir().expect("failed to create temporary directory for merged overlay");
+    if let Some(RootFs::Path(path)) = &cfg.rootfs {
+        let lockfile_path = path
+            .parent()
+            .and_then(|p| Some(p.join(path.file_name()?)))
+            .map(|p| p.with_extension("cbrt_lock"))
+            .expect("couldn't construct lockfile path");
 
-    let rootfs = match &cfg.rootfs {
-        Some(RootFs::Path(path)) => {
-            let lockfile_path = path
-                .parent()
-                .and_then(|p| Some(p.join(path.file_name()?)))
-                .map(|p| p.with_extension("cbrt_lock"))
-                .expect("couldn't construct lockfile path");
+        let root_dir = open(
+            &lockfile_path,
+            OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
+            Mode::from_bits(0o444).unwrap(),
+        )
+        .expect("couldn't open rootfs for locking");
 
-            let root_dir = open(
-                &lockfile_path,
-                OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_CLOEXEC,
-                Mode::from_bits(0o444).unwrap(),
-            )
-            .expect("couldn't open rootfs for locking");
-
-            flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
-            Some(path.to_path_buf())
-        }
-        Some(RootFs::Overlay { .. }) => Some(merged_overlay.path().to_path_buf()),
-        None => None,
-    };
+        flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
+    }
 
     let euid = nix::unistd::geteuid();
     let egid = nix::unistd::getegid();
@@ -530,7 +645,6 @@ fn main() {
             match unsafe { nix::unistd::fork() } {
                 Ok(nix::unistd::ForkResult::Child) => {
                     drop(sock_main);
-                    forget(merged_overlay);
                     run_userns_helper(
                         euid,
                         egid,
@@ -571,16 +685,31 @@ fn main() {
         setup_userns_direct(&cfg, euid, egid);
     }
 
-    // Change user IDs.
-    nix::unistd::setuid(nix::unistd::Uid::from_raw(cfg.user.uid)).expect("failed to set UID");
-    nix::unistd::setgid(nix::unistd::Gid::from_raw(cfg.user.gid)).expect("failed to set GID");
+    // Some configurations need a per-run directory to store temporary data.
+    // Note that cleanup of the per-run directory requires us to be in the user namespace
+    // (but this process is in the user namespace anyway).
+    let need_tempdir = matches!(cfg.rootfs, Some(RootFs::Overlay { .. }));
+    let run_tempdir: Option<tempfile::TempDir> = if need_tempdir {
+        let run_root = workspace
+            .as_deref()
+            .expect("--workspace is required for overlay rootfs")
+            .join("run");
+        std::fs::create_dir_all(&run_root)
+            .expect("failed to create cbuildrt overlay cache directory");
+        let dir = tempfile::Builder::new()
+            .tempdir_in(&run_root)
+            .expect("failed to create per-run overlay tempdir");
+        Some(dir)
+    } else {
+        None
+    };
+    let run_dir = run_tempdir.as_ref().map(|d| d.path());
 
     // fork() and run init in the child.
     // The parent waits for the child to terminate.
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
-            forget(merged_overlay);
-            run_init(&cfg, rootfs.as_deref());
+            run_init(&cfg, workspace.as_deref(), run_dir);
         }
         Ok(nix::unistd::ForkResult::Parent { child: init_pid }) => {
             eprintln!("PID init is {} (outside the namespace)", init_pid);
@@ -593,7 +722,6 @@ fn main() {
                 _ => panic!("waiting for init returned {:?}", init_status),
             };
 
-            drop(merged_overlay);
             exit(init_code);
         }
         Err(_) => panic!("failed to fork from cbuildrt"),
