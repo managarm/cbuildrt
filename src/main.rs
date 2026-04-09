@@ -71,6 +71,13 @@ struct Config {
     sub_uid: Option<SubIdRange>,
     #[serde(default)]
     sub_gid: Option<SubIdRange>,
+    // Do not chroot() into the rootfs. Note that we still chdir() into it.
+    // This is useful to build container base images by using host tools (e.g., debootstrap).
+    #[serde(default)]
+    no_chroot: bool,
+    // Do not perform system mounts such as /proc, /tmp, /sys etc.
+    #[serde(default)]
+    no_system_mounts: bool,
 }
 
 // Returns the config and the workspace directory (if one is passed).
@@ -250,105 +257,106 @@ fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> !
         }
 
         // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp, /var/tmp, /sys, and /proc.
+        if !cfg.no_system_mounts {
+            let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
+            for f in dev_overlays {
+                nix::mount::mount(
+                    Some(&Path::new("/dev/").join(f)),
+                    &concat_absolute(rootfs, "/dev/").join(f),
+                    None::<&str>,
+                    nix::mount::MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .expect("failed to mount device");
+            }
 
-        let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
-        for f in dev_overlays {
+            if !cfg.isolate_network {
+                nix::mount::mount(
+                    Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
+                    &concat_absolute(rootfs, "/etc/resolv.conf"),
+                    None::<&str>,
+                    nix::mount::MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .expect("failed to mount /etc/resolv.conf");
+            }
+
             nix::mount::mount(
-                Some(&Path::new("/dev/").join(f)),
-                &concat_absolute(rootfs, "/dev/").join(f),
                 None::<&str>,
-                nix::mount::MsFlags::MS_BIND,
+                &concat_absolute(rootfs, "/dev/pts"),
+                Some("devpts"),
+                nix::mount::MsFlags::empty(),
                 None::<&str>,
             )
-            .expect("failed to mount device");
-        }
+            .expect("failed to mount /dev/pts");
 
-        if !cfg.isolate_network {
             nix::mount::mount(
-                Some(&std::fs::canonicalize("/etc/resolv.conf").unwrap()),
-                &concat_absolute(rootfs, "/etc/resolv.conf"),
                 None::<&str>,
-                nix::mount::MsFlags::MS_BIND,
+                &concat_absolute(rootfs, "/dev/shm"),
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
                 None::<&str>,
             )
-            .expect("failed to mount /etc/resolv.conf");
+            .expect("failed to mount /dev/shm");
+
+            nix::mount::mount(
+                None::<&str>,
+                &concat_absolute(rootfs, "/run"),
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .expect("failed to mount /run");
+
+            nix::mount::mount(
+                None::<&str>,
+                &concat_absolute(rootfs, "/tmp"),
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .expect("failed to mount /tmp");
+
+            nix::mount::mount(
+                None::<&str>,
+                &concat_absolute(rootfs, "/proc"),
+                Some("proc"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .expect("failed to mount /proc");
+
+            // Mount /var/tmp as tmpfs.
+            // TODO: Technically /var/tmp is supposed to survive boots.
+            nix::mount::mount(
+                None::<&str>,
+                &concat_absolute(rootfs, "/var/tmp"),
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .expect("failed to mount /var/tmp");
+
+            // Mount /sys via recursive bind + slave.
+            // This is needed such that the container can access /sys/fs/* and similar.
+            nix::mount::mount(
+                Some(Path::new("/sys")),
+                &concat_absolute(rootfs, "/sys"),
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .expect("failed to bind mount /sys");
+
+            nix::mount::mount(
+                None::<&str>,
+                &concat_absolute(rootfs, "/sys"),
+                None::<&str>,
+                nix::mount::MsFlags::MS_SLAVE | nix::mount::MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .expect("failed to make /sys slave");
         }
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/dev/pts"),
-            Some("devpts"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /dev/pts");
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/dev/shm"),
-            Some("tmpfs"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /dev/shm");
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/run"),
-            Some("tmpfs"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /run");
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/tmp"),
-            Some("tmpfs"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /tmp");
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/proc"),
-            Some("proc"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /proc");
-
-        // Mount /var/tmp as tmpfs.
-        // TODO: Technically /var/tmp is supposed to survive boots.
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/var/tmp"),
-            Some("tmpfs"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("failed to mount /var/tmp");
-
-        // Mount /sys via recursive bind + slave.
-        // This is needed such that the container can access /sys/fs/* and similar.
-        nix::mount::mount(
-            Some(Path::new("/sys")),
-            &concat_absolute(rootfs, "/sys"),
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .expect("failed to bind mount /sys");
-
-        nix::mount::mount(
-            None::<&str>,
-            &concat_absolute(rootfs, "/sys"),
-            None::<&str>,
-            nix::mount::MsFlags::MS_SLAVE | nix::mount::MsFlags::MS_REC,
-            None::<&str>,
-        )
-        .expect("failed to make /sys slave");
     }
 
     // Perform bind mounts requested by user.
@@ -372,8 +380,10 @@ fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> !
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
             if let Some(rootfs) = rootfs {
-                nix::unistd::chroot(rootfs).expect("failed to chroot()");
-                nix::unistd::chdir("/").expect("failed to chdir() to root directory");
+                nix::unistd::chdir(rootfs).expect("failed to chdir() to rootfs");
+                if !cfg.no_chroot {
+                    nix::unistd::chroot(".").expect("failed to chroot()");
+                }
             }
 
             // setuid/setgid in the child only such that the init process can do cleanup as root.
@@ -384,13 +394,15 @@ fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> !
                 .expect("failed to set UID");
 
             // Reset PATH to the default value
-            if cfg.user.uid == 0 {
-                std::env::set_var(
-                    "PATH",
-                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                );
-            } else {
-                std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+            if !cfg.no_chroot {
+                if cfg.user.uid == 0 {
+                    std::env::set_var(
+                        "PATH",
+                        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    );
+                } else {
+                    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+                }
             }
 
             // Apply user-specified environment variables.
