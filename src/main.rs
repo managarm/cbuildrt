@@ -17,6 +17,12 @@ struct BindMount {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Volume {
+    name: String,
+    destination: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
 struct User {
     uid: uid_t,
     gid: gid_t,
@@ -67,6 +73,8 @@ struct Config {
     #[serde(default)]
     isolate_network: bool,
     bind_mounts: Vec<BindMount>,
+    #[serde(default)]
+    volumes: Vec<Volume>,
     #[serde(default)]
     sub_uid: Option<SubIdRange>,
     #[serde(default)]
@@ -369,6 +377,25 @@ fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> !
             None::<&str>,
         )
         .expect("failed to perform bind mount");
+    }
+
+    // Perform volume mounts.
+    for vol in &cfg.volumes {
+        let source = workspace
+            .expect("--workspace is required for volumes")
+            .join("volumes")
+            .join(&vol.name);
+        std::fs::create_dir_all(&source).expect("failed to create volume directory");
+        let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
+        std::fs::create_dir_all(&dest).expect("failed to create volume mount point");
+        nix::mount::mount(
+            Some(&source),
+            &dest,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .expect("failed to perform volume mount");
     }
 
     // TODO: We could drop privileges here.
