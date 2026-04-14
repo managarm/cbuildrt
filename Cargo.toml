@@ -8,7 +8,7 @@ repository = "https://github.com/managarm/cbuildrt"
 edition = "2018"
 
 [dependencies]
-clap = "2.33"
+clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 nix = "0.20"
 rustix = { version = "1.1.3", features = ["mount", "net", "process"] }

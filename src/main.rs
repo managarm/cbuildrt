@@ -1,41 +1,62 @@
-use clap::crate_version;
+use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 use runtime::{run, Config};
-use std::fs::File;
-use std::path::PathBuf;
 
 mod runtime;
 
-// Returns the config and the workspace directory (if one is passed).
-// TODO: This function does not really perform error checking;
-//       for now, we assume that xbstrap passes sane values.
-fn make_config_from_cli() -> (Config, Option<PathBuf>) {
-    let matches = clap::App::new("cbuildrt")
-        .version(crate_version!())
-        .arg(
-            clap::Arg::with_name("workspace")
-                .long("workspace")
-                .value_name("DIR")
-                .help("Directory to store cbuildrt's data (such as overlayfs layers)")
-                .takes_value(true),
-        )
-        .arg(
-            clap::Arg::with_name("cbuild-json")
-                .help("cbuild.json file")
-                .required(true),
-        )
-        .get_matches();
+#[derive(Parser)]
+#[command(name = "cbuildrt", version, subcommand_precedence_over_arg = true)]
+struct Cli {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory to store cbuildrt's data (such as overlayfs layers)"
+    )]
+    workspace: Option<PathBuf>,
 
-    let workspace = matches.value_of("workspace").map(PathBuf::from);
+    /// cbuild.json file (legacy invocation without subcommand)
+    cbuild_json: Option<PathBuf>,
 
-    let cfg_f =
-        File::open(matches.value_of("cbuild-json").unwrap()).expect("unable to open cbuild.json");
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    let cfg = serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json");
-    (cfg, workspace)
+#[derive(Subcommand)]
+enum Command {
+    /// Run a container from a cbuild.json description
+    Run(RunCommandArgs),
+}
+
+#[derive(Args)]
+struct RunCommandArgs {
+    /// cbuild.json file
+    cbuild_json: PathBuf,
 }
 
 fn main() {
-    let (cfg, workspace) = make_config_from_cli();
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Run(args)) => {
+            do_run_subcmd(cli.workspace, &args.cbuild_json);
+        }
+        None => {
+            let cbuild_json = cli.cbuild_json.unwrap_or_else(|| {
+                Cli::command()
+                    .error(
+                        ErrorKind::MissingRequiredArgument,
+                        "cbuild.json is required if no subcommand is passed",
+                    )
+                    .exit();
+            });
+            do_run_subcmd(cli.workspace, &cbuild_json);
+        }
+    }
+}
+
+fn do_run_subcmd(workspace: Option<PathBuf>, cbuild_json: &Path) {
+    let cfg_f = File::open(cbuild_json).expect("unable to open cbuild.json");
+    let cfg: Config = serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json");
     run(cfg, workspace);
 }

@@ -9,6 +9,25 @@ fn write_config(config: &serde_json::Value) -> tempfile::NamedTempFile {
     f
 }
 
+// cbuildrt must work without any subcommand for backwards compatibility with old xbstrap.
+#[test]
+fn no_subcommand() {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let config = serde_json::json!({
+        "user": { "uid": uid, "gid": gid },
+        "process": { "args": ["true"] },
+        "bindMounts": [],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg(f.path())
+        .assert()
+        .success();
+}
+
 #[test]
 fn run_true() {
     let uid = rustix::process::getuid().as_raw();
@@ -22,6 +41,7 @@ fn run_true() {
 
     Command::cargo_bin("cbuildrt")
         .unwrap()
+        .args(["run"])
         .arg(f.path())
         .assert()
         .success();
@@ -40,6 +60,7 @@ fn run_echo() {
 
     Command::cargo_bin("cbuildrt")
         .unwrap()
+        .args(["run"])
         .arg(f.path())
         .assert()
         .success()
@@ -59,6 +80,7 @@ fn auto_subuid_subgid() {
 
     Command::cargo_bin("cbuildrt")
         .unwrap()
+        .args(["run"])
         .arg(f.path())
         .assert()
         .success()
@@ -81,6 +103,7 @@ fn custom_environ() {
 
     Command::cargo_bin("cbuildrt")
         .unwrap()
+        .args(["run"])
         .arg(f.path())
         .assert()
         .success()
