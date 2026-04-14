@@ -69,18 +69,27 @@ fn run_echo() {
 
 #[test]
 fn auto_subuid_subgid() {
+    let ws = tempfile::tempdir().unwrap();
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .args(["--workspace"])
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+
     let config = serde_json::json!({
         "user": { "uid": 0, "gid": 0 },
         "process": { "args": ["/usr/bin/id"] },
         "bindMounts": [],
-        "subUid": { "auto": true, "self": 0 },
-        "subGid": { "auto": true, "self": 0 },
     });
     let f = write_config(&config);
 
     Command::cargo_bin("cbuildrt")
         .unwrap()
-        .args(["run"])
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("run")
         .arg(f.path())
         .assert()
         .success()

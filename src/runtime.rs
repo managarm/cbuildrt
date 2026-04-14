@@ -9,6 +9,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use crate::workspace::Workspace;
+
 #[derive(Serialize, Deserialize)]
 struct BindMount {
     destination: PathBuf,
@@ -22,6 +24,7 @@ struct Volume {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct User {
     uid: uid_t,
     gid: gid_t,
@@ -48,19 +51,6 @@ enum RootFs {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SubIdRange {
-    #[serde(default)]
-    auto: bool,
-    #[serde(default)]
-    start: u64,
-    #[serde(default)]
-    count: u64,
-    #[serde(rename = "self")]
-    self_id: u64,
-}
-
-#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
     // If no rootfs is passed, we are running in namespace only mode.
@@ -75,9 +65,7 @@ pub struct Config {
     #[serde(default)]
     volumes: Vec<Volume>,
     #[serde(default)]
-    sub_uid: Option<SubIdRange>,
-    #[serde(default)]
-    sub_gid: Option<SubIdRange>,
+    map_current_user_to: Option<User>,
     // Do not chroot() into the rootfs. Note that we still chdir() into it.
     // This is useful to build container base images by using host tools (e.g., debootstrap).
     #[serde(default)]
@@ -92,7 +80,7 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
     lhs.as_ref().join(rhs.as_ref().strip_prefix("/").unwrap())
 }
 
-fn resolve_tar_layer(workspace: Option<&Path>, path: &Path) -> PathBuf {
+fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
     let ext = path.extension().and_then(|e| e.to_str());
     if ext != Some("tar") {
         return path.to_path_buf();
@@ -102,9 +90,7 @@ fn resolve_tar_layer(workspace: Option<&Path>, path: &Path) -> PathBuf {
         .file_stem()
         .expect("filename of tar lower layer has empty prefix");
 
-    let workspace =
-        workspace.expect("--workspace is required when an overlay uses tar lower layers");
-    let layers_root = workspace.join("layers");
+    let layers_root = workspace.layers_dir();
 
     // If the tar layer is already extracted, re-use the extracted version.
     let extracted_dir = layers_root.join(stem);
@@ -135,7 +121,7 @@ fn resolve_tar_layer(workspace: Option<&Path>, path: &Path) -> PathBuf {
     extracted_dir
 }
 
-fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> ! {
+fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     // Derive the rootfs path.
     let rootfs_owned: Option<PathBuf> = match &cfg.rootfs {
         Some(RootFs::Path(path)) => Some(path.clone()),
@@ -351,10 +337,7 @@ fn run_init(cfg: &Config, workspace: Option<&Path>, run_dir: Option<&Path>) -> !
 
     // Perform volume mounts.
     for vol in &cfg.volumes {
-        let source = workspace
-            .expect("--workspace is required for volumes")
-            .join("volumes")
-            .join(&vol.name);
+        let source = workspace.volumes_dir().join(&vol.name);
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
         std::fs::create_dir_all(&dest).expect("failed to create volume mount point");
@@ -486,36 +469,6 @@ fn setup_userns_with_helper(sock: rustix::fd::BorrowedFd) {
     }
 }
 
-fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {
-    let content =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
-    for line in content.lines() {
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-        if parts.len() == 3 && parts[0] == username {
-            let start: u64 = parts[1]
-                .parse()
-                .expect("invalid start in subordinate ID file");
-            let count: u64 = parts[2]
-                .parse()
-                .expect("invalid count in subordinate ID file");
-            return (start, count);
-        }
-    }
-    panic!("no entry for user '{}' in {}", username, path);
-}
-
-fn resolve_id_range(range: &SubIdRange, file: &str) -> (u64, u64) {
-    if range.auto {
-        let euid = nix::unistd::geteuid();
-        let user = nix::unistd::User::from_uid(euid)
-            .expect("failed to look up user")
-            .unwrap_or_else(|| panic!("no passwd entry for uid {}", euid));
-        parse_subordinate_file(file, &user.name)
-    } else {
-        (range.start, range.count)
-    }
-}
-
 // Build setuidmap/setgidmap args to map [0, sub_count) inside userns
 // to [sub_start, sub_start + sub_count) outside userns,
 // except for self_id which is mapped to host_self_id.
@@ -612,7 +565,7 @@ fn run_userns_helper(
     exit(0);
 }
 
-pub fn run(cfg: Config, workspace: Option<PathBuf>) {
+pub fn run(cfg: Config, workspace: Workspace) {
     if let Some(RootFs::Path(path)) = &cfg.rootfs {
         let lockfile_path = path
             .parent()
@@ -634,44 +587,44 @@ pub fn run(cfg: Config, workspace: Option<PathBuf>) {
     let egid = nix::unistd::getegid();
 
     // Launch a helper process to run set{uid,gid}map.
-    let (helper_pid, sock_main) =
-        if let (Some(sub_uid), Some(sub_gid)) = (&cfg.sub_uid, &cfg.sub_gid) {
-            let resolved_subuid = resolve_id_range(sub_uid, "/etc/subuid");
-            let resolved_subgid = resolve_id_range(sub_gid, "/etc/subgid");
+    let (helper_pid, sock_main) = if let Some(sub_ids) = workspace.sub_ids().copied() {
+        // Set up socketpair for helper synchronization if using subordinate IDs.
+        let (sock_main, sock_helper) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::SEQPACKET,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("failed to create socketpair for helper sync");
 
-            // Set up socketpair for helper synchronization if using subordinate IDs.
-            let (sock_main, sock_helper) = rustix::net::socketpair(
-                rustix::net::AddressFamily::UNIX,
-                rustix::net::SocketType::SEQPACKET,
-                rustix::net::SocketFlags::CLOEXEC,
-                None,
-            )
-            .expect("failed to create socketpair for helper sync");
-
-            let main_pid = nix::unistd::getpid();
-            match unsafe { nix::unistd::fork() } {
-                Ok(nix::unistd::ForkResult::Child) => {
-                    drop(sock_main);
-                    run_userns_helper(
-                        euid,
-                        egid,
-                        resolved_subuid,
-                        resolved_subgid,
-                        sub_uid.self_id,
-                        sub_gid.self_id,
-                        main_pid,
-                        sock_helper,
-                    );
-                }
-                Ok(nix::unistd::ForkResult::Parent { child }) => {
-                    drop(sock_helper);
-                    (Some(child), Some(sock_main))
-                }
-                Err(_) => panic!("failed to fork helper for ID mapping"),
+        let map_to = cfg.map_current_user_to.as_ref().unwrap_or(&cfg.user);
+        let main_pid = nix::unistd::getpid();
+        match unsafe { nix::unistd::fork() } {
+            Ok(nix::unistd::ForkResult::Child) => {
+                drop(sock_main);
+                run_userns_helper(
+                    euid,
+                    egid,
+                    sub_ids.uid,
+                    sub_ids.gid,
+                    map_to.uid as u64,
+                    map_to.gid as u64,
+                    main_pid,
+                    sock_helper,
+                );
             }
-        } else {
-            (None, None)
-        };
+            Ok(nix::unistd::ForkResult::Parent { child }) => {
+                drop(sock_helper);
+                (Some(child), Some(sock_main))
+            }
+            Err(_) => panic!("failed to fork helper for ID mapping"),
+        }
+    } else {
+        if cfg.map_current_user_to.is_some() {
+            panic!("mapping the current uid/gid requires a workspace with sub uid/gid mappings");
+        }
+        (None, None)
+    };
 
     // Enter the user namespace and let children enter a new PID namespace.
     // We cannot do mounts in this process yet, as this the process itself
@@ -681,7 +634,7 @@ pub fn run(cfg: Config, workspace: Option<PathBuf>) {
     )
     .expect("failed to unshare()");
 
-    if cfg.sub_uid.is_some() && cfg.sub_gid.is_some() {
+    if workspace.sub_ids().is_some() {
         setup_userns_with_helper(sock_main.unwrap().as_fd());
         nix::sys::wait::waitpid(
             helper_pid.expect("set{uid,gid}map helper PID must be known"),
@@ -697,10 +650,7 @@ pub fn run(cfg: Config, workspace: Option<PathBuf>) {
     // (but this process is in the user namespace anyway).
     let need_tempdir = matches!(cfg.rootfs, Some(RootFs::Overlay { .. }));
     let run_tempdir: Option<tempfile::TempDir> = if need_tempdir {
-        let run_root = workspace
-            .as_deref()
-            .expect("--workspace is required for overlay rootfs")
-            .join("run");
+        let run_root = workspace.run_dir();
         std::fs::create_dir_all(&run_root)
             .expect("failed to create cbuildrt overlay cache directory");
         let dir = tempfile::Builder::new()
@@ -716,7 +666,7 @@ pub fn run(cfg: Config, workspace: Option<PathBuf>) {
     // The parent waits for the child to terminate.
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
-            run_init(&cfg, workspace.as_deref(), run_dir);
+            run_init(&cfg, &workspace, run_dir);
         }
         Ok(nix::unistd::ForkResult::Parent { child: init_pid }) => {
             eprintln!("PID init is {} (outside the namespace)", init_pid);

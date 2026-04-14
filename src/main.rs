@@ -3,8 +3,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use runtime::{run, Config};
+use workspace::{SubIds, Workspace};
 
 mod runtime;
+mod workspace;
 
 #[derive(Parser)]
 #[command(name = "cbuildrt", version, subcommand_precedence_over_arg = true)]
@@ -25,6 +27,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize a workspace
+    Init(InitCommandArgs),
     /// Run a container from a cbuild.json description
     Run(RunCommandArgs),
 }
@@ -35,11 +39,48 @@ struct RunCommandArgs {
     cbuild_json: PathBuf,
 }
 
+#[derive(Args)]
+struct InitCommandArgs {
+    #[arg(long)]
+    pub no_sub_ids: bool,
+    #[arg(
+        long,
+        value_name = "START",
+        conflicts_with = "no_sub_ids",
+        requires = "sub_uid_count"
+    )]
+    pub sub_uid_start: Option<u64>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        conflicts_with = "no_sub_ids",
+        requires = "sub_uid_start"
+    )]
+    pub sub_uid_count: Option<u64>,
+    #[arg(
+        long,
+        value_name = "START",
+        conflicts_with = "no_sub_ids",
+        requires = "sub_gid_count"
+    )]
+    pub sub_gid_start: Option<u64>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        conflicts_with = "no_sub_ids",
+        requires = "sub_gid_start"
+    )]
+    pub sub_gid_count: Option<u64>,
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Init(args)) => {
+            do_init_subcmd(cli.workspace.as_deref(), &args);
+        }
         Some(Command::Run(args)) => {
-            do_run_subcmd(cli.workspace, &args.cbuild_json);
+            do_run_subcmd(cli.workspace.as_deref(), &args.cbuild_json);
         }
         None => {
             let cbuild_json = cli.cbuild_json.unwrap_or_else(|| {
@@ -50,13 +91,48 @@ fn main() {
                     )
                     .exit();
             });
-            do_run_subcmd(cli.workspace, &cbuild_json);
+            do_run_subcmd(cli.workspace.as_deref(), &cbuild_json);
         }
     }
 }
 
-fn do_run_subcmd(workspace: Option<PathBuf>, cbuild_json: &Path) {
+fn do_init_subcmd(workspace_path: Option<&Path>, args: &InitCommandArgs) {
+    let workspace = workspace_path.unwrap_or_else(|| {
+        Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--workspace is required for init",
+            )
+            .exit();
+    });
+
+    let sub_ids = if args.no_sub_ids {
+        None
+    } else {
+        let uid = match (args.sub_uid_start, args.sub_uid_count) {
+            (Some(start), Some(count)) => (start, count),
+            (None, None) => workspace::auto_subordinate_range("/etc/subuid"),
+            _ => panic!("need both sub_uid_start and sub_uid_count"),
+        };
+        let gid = match (args.sub_gid_start, args.sub_gid_count) {
+            (Some(start), Some(count)) => (start, count),
+            (None, None) => workspace::auto_subordinate_range("/etc/subgid"),
+            _ => panic!("need both sub_gid_start and sub_gid_count"),
+        };
+        Some(SubIds { uid, gid })
+    };
+
+    Workspace::init(workspace, sub_ids);
+}
+
+fn do_run_subcmd(workspace_path: Option<&Path>, cbuild_json: &Path) {
     let cfg_f = File::open(cbuild_json).expect("unable to open cbuild.json");
     let cfg: Config = serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json");
+
+    let workspace = match workspace_path {
+        Some(p) => Workspace::load(p),
+        None => Workspace::temporary(),
+    };
+
     run(cfg, workspace);
 }
