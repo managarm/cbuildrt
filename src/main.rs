@@ -1,6 +1,7 @@
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 
 use runtime::{run, Config};
 use workspace::{SubIds, Workspace};
@@ -31,6 +32,8 @@ enum Command {
     Init(InitCommandArgs),
     /// Run a container from a cbuild.json description
     Run(RunCommandArgs),
+    /// Purge extracted layers from the workspace
+    Purge,
 }
 
 #[derive(Args)]
@@ -82,6 +85,9 @@ fn main() {
         Some(Command::Run(args)) => {
             do_run_subcmd(cli.workspace.as_deref(), &args.cbuild_json);
         }
+        Some(Command::Purge) => {
+            do_purge_subcmd(cli.workspace.as_deref());
+        }
         None => {
             let cbuild_json = cli.cbuild_json.unwrap_or_else(|| {
                 Cli::command()
@@ -125,6 +131,25 @@ fn do_init_subcmd(workspace_path: Option<&Path>, args: &InitCommandArgs) {
     Workspace::init(workspace, sub_ids);
 }
 
+fn do_purge_subcmd(workspace_path: Option<&Path>) {
+    let workspace_path = workspace_path.unwrap_or_else(|| {
+        Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--workspace is required for purge",
+            )
+            .exit();
+    });
+    let workspace = Workspace::load(workspace_path);
+    let exit_code = unsafe {
+        runtime::run_userns(&workspace, None, None, || {
+            workspace.purge_layers();
+            exit(0);
+        })
+    };
+    exit(exit_code);
+}
+
 fn do_run_subcmd(workspace_path: Option<&Path>, cbuild_json: &Path) {
     let cfg_f = File::open(cbuild_json).expect("unable to open cbuild.json");
     let cfg: Config = serde_json::from_reader(cfg_f).expect("failed to parse cbuild.json");
@@ -134,5 +159,6 @@ fn do_run_subcmd(workspace_path: Option<&Path>, cbuild_json: &Path) {
         None => Workspace::temporary(),
     };
 
-    run(cfg, workspace);
+    let exit_code = unsafe { run(cfg, workspace) };
+    std::process::exit(exit_code);
 }
