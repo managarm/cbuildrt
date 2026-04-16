@@ -132,6 +132,19 @@ impl Workspace {
     pub fn sub_ids(&self) -> Option<&SubIds> {
         self.sub_ids.as_ref()
     }
+
+    pub fn purge_layers(&self) {
+        let layers_dir = self.layers_dir();
+        if layers_dir.exists() {
+            for entry in std::fs::read_dir(&layers_dir).expect("failed to read layers directory") {
+                let entry = entry.expect("failed to read directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).expect("failed to remove layer directory");
+                }
+            }
+        }
+    }
 }
 
 fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {
