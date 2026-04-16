@@ -4,6 +4,7 @@ use nix::sys::stat::Mode;
 use rustix::fd::AsFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -444,14 +445,19 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     };
 }
 
-fn setup_userns_direct(cfg: &Config, euid: nix::unistd::Uid, egid: nix::unistd::Gid) {
+fn setup_userns_direct(
+    self_uid: u64,
+    self_gid: u64,
+    euid: nix::unistd::Uid,
+    egid: nix::unistd::Gid,
+) {
     // Write the uid_map and gid_map files. Linux demands that we write setgroups first
     // (otherwise, we need to be root in the outer namespace).
     std::fs::write("/proc/self/setgroups", "deny").expect("unable to write setgroups file");
 
-    std::fs::write("/proc/self/uid_map", format!("{} {} 1", cfg.user.uid, euid))
+    std::fs::write("/proc/self/uid_map", format!("{} {} 1", self_uid, euid))
         .expect("unable to write uid_map file");
-    std::fs::write("/proc/self/gid_map", format!("{} {} 1", cfg.user.gid, egid))
+    std::fs::write("/proc/self/gid_map", format!("{} {} 1", self_gid, egid))
         .expect("unable to write gid_map file");
 }
 
@@ -504,28 +510,31 @@ fn run_userns_helper(
     egid: nix::unistd::Gid,
     subuid: (u64, u64),
     subgid: (u64, u64),
-    self_uid: u64,
-    self_gid: u64,
-    main_pid: nix::unistd::Pid,
-    sock: rustix::fd::OwnedFd,
-) -> ! {
-    // Wait for the main process to signal that it has unshared.
+    self_uid: Option<u64>,
+    self_gid: Option<u64>,
+    target_pid: libc::pid_t,
+    sock: rustix::fd::BorrowedFd,
+) {
+    // Wait for the target process to signal that it has unshared.
     let mut ready = [0u8; 1];
-    let (_, n) = rustix::net::recv(&sock, &mut ready, rustix::net::RecvFlags::empty())
-        .expect("failed to read from main process");
+    let (_, n) = rustix::net::recv(sock, &mut ready, rustix::net::RecvFlags::empty())
+        .expect("failed to read from target process");
     if n == 0 {
+        eprintln!("target process closed socket before signaling");
         exit(1);
     }
 
-    let uid_mappings = build_id_mapping_args(self_uid, euid.as_raw().into(), subuid.0, subuid.1);
+    let uid_mappings = match self_uid {
+        Some(uid) => build_id_mapping_args(uid, euid.as_raw().into(), subuid.0, subuid.1),
+        None => vec![(0, subuid.0, subuid.1)],
+    };
     let mut cmd = std::process::Command::new("newuidmap");
-    cmd.arg(main_pid.as_raw().to_string());
+    cmd.arg(target_pid.to_string());
     for (inner, outer, count) in &uid_mappings {
         cmd.args([inner.to_string(), outer.to_string(), count.to_string()]);
     }
     let status = cmd.status();
     match status {
-        Ok(s) if s.success() => {}
         Ok(s) => {
             if !s.success() {
                 eprintln!("newuidmap failed with exit code {:?}", s.code());
@@ -538,9 +547,12 @@ fn run_userns_helper(
         }
     }
 
-    let gid_mappings = build_id_mapping_args(self_gid, egid.as_raw().into(), subgid.0, subgid.1);
+    let gid_mappings = match self_gid {
+        Some(gid) => build_id_mapping_args(gid, egid.as_raw().into(), subgid.0, subgid.1),
+        None => vec![(0, subgid.0, subgid.1)],
+    };
     let mut cmd = std::process::Command::new("newgidmap");
-    cmd.arg(main_pid.as_raw().to_string());
+    cmd.arg(target_pid.to_string());
     for (inner, outer, count) in &gid_mappings {
         cmd.args([inner.to_string(), outer.to_string(), count.to_string()]);
     }
@@ -558,14 +570,119 @@ fn run_userns_helper(
         }
     }
 
-    // Signal the main process that mappings are done.
-    rustix::net::send(&sock, &[1u8], rustix::net::SendFlags::empty())
-        .expect("failed to signal main process");
-
-    exit(0);
+    // Signal the target process that mappings are done.
+    rustix::net::send(sock, &[1u8], rustix::net::SendFlags::empty())
+        .expect("failed to signal target process");
 }
 
-pub fn run(cfg: Config, workspace: Workspace) {
+unsafe fn raw_clone(flags: libc::c_int) -> libc::pid_t {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (flags | libc::SIGCHLD) as libc::c_ulong,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    if ret < 0 {
+        let error = std::io::Error::last_os_error();
+        panic!("clone() failed: {}", error);
+    }
+    ret as libc::pid_t
+}
+
+/// Run a callback inside a workspace's user namespace.
+///
+/// # Safety
+/// The caller must ensure the current process is single-threaded.
+// TODO: Use ! as a return type instead of Infallible once it is stabilized.
+pub unsafe fn run_userns<F: FnOnce() -> Infallible>(
+    workspace: &Workspace,
+    self_uid: Option<u64>,
+    self_gid: Option<u64>,
+    f: F,
+) -> i32 {
+    let euid = nix::unistd::geteuid();
+    let egid = nix::unistd::getegid();
+
+    // Create socketpair for synchronization (only needed for sub_ids case).
+    let (sock_parent, sock_child) = if workspace.sub_ids().is_some() {
+        let (sp, sc) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::SEQPACKET,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("failed to create socketpair");
+        (Some(sp), Some(sc))
+    } else {
+        (None, None)
+    };
+
+    let child_pid = raw_clone(libc::CLONE_NEWUSER);
+    if child_pid == 0 {
+        drop(sock_parent);
+
+        if workspace.sub_ids().is_some() {
+            setup_userns_with_helper(sock_child.as_ref().unwrap().as_fd());
+        } else {
+            // If no self_uid / self_gid is passed, we default to zero here
+            // as the direct mapping method has to pick some uid / gid.
+            setup_userns_direct(self_uid.unwrap_or(0), self_gid.unwrap_or(0), euid, egid);
+        }
+
+        // Explicit drop since we exit() below.
+        drop(sock_child);
+
+        f();
+        exit(0);
+    } else {
+        drop(sock_child);
+
+        if let Some(sub_ids) = workspace.sub_ids().copied() {
+            run_userns_helper(
+                euid,
+                egid,
+                sub_ids.uid,
+                sub_ids.gid,
+                self_uid,
+                self_gid,
+                child_pid,
+                sock_parent.as_ref().unwrap().as_fd(),
+            );
+        }
+
+        // Wait for child.
+        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(child_pid), None)
+            .expect("failed to wait for child");
+        match status {
+            nix::sys::wait::WaitStatus::Exited(_, code) => code,
+            _ => panic!("unexpected wait status: {:?}", status),
+        }
+    }
+}
+
+/// Run a callback as PID 1 inside a new PID namespace.
+///
+/// # Safety
+/// The caller must ensure the current process is single-threaded.
+// TODO: Use ! as a return type instead of Infallible once it is stabilized.
+unsafe fn run_pidns<F: FnOnce() -> Infallible>(f: F) -> i32 {
+    let child_pid = raw_clone(libc::CLONE_NEWPID);
+    if child_pid == 0 {
+        f();
+        exit(0);
+    } else {
+        // Wait for child.
+        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(child_pid), None)
+            .expect("failed to wait for child");
+        match status {
+            nix::sys::wait::WaitStatus::Exited(_, code) => code,
+            _ => panic!("unexpected wait status: {:?}", status),
+        }
+    }
+}
+
+pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
     if let Some(RootFs::Path(path)) = &cfg.rootfs {
         let lockfile_path = path
             .parent()
@@ -583,71 +700,25 @@ pub fn run(cfg: Config, workspace: Workspace) {
         flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
     }
 
-    let euid = nix::unistd::geteuid();
-    let egid = nix::unistd::getegid();
-
-    // Launch a helper process to run set{uid,gid}map.
-    let (helper_pid, sock_main) = if let Some(sub_ids) = workspace.sub_ids().copied() {
-        // Set up socketpair for helper synchronization if using subordinate IDs.
-        let (sock_main, sock_helper) = rustix::net::socketpair(
-            rustix::net::AddressFamily::UNIX,
-            rustix::net::SocketType::SEQPACKET,
-            rustix::net::SocketFlags::CLOEXEC,
-            None,
+    let map_to = cfg.map_current_user_to.as_ref().unwrap_or(&cfg.user);
+    unsafe {
+        run_userns(
+            &workspace,
+            Some(map_to.uid as u64),
+            Some(map_to.gid as u64),
+            || {
+                let exit_code = run_supervisor(cfg, &workspace);
+                exit(exit_code);
+            },
         )
-        .expect("failed to create socketpair for helper sync");
-
-        let map_to = cfg.map_current_user_to.as_ref().unwrap_or(&cfg.user);
-        let main_pid = nix::unistd::getpid();
-        match unsafe { nix::unistd::fork() } {
-            Ok(nix::unistd::ForkResult::Child) => {
-                drop(sock_main);
-                run_userns_helper(
-                    euid,
-                    egid,
-                    sub_ids.uid,
-                    sub_ids.gid,
-                    map_to.uid as u64,
-                    map_to.gid as u64,
-                    main_pid,
-                    sock_helper,
-                );
-            }
-            Ok(nix::unistd::ForkResult::Parent { child }) => {
-                drop(sock_helper);
-                (Some(child), Some(sock_main))
-            }
-            Err(_) => panic!("failed to fork helper for ID mapping"),
-        }
-    } else {
-        if cfg.map_current_user_to.is_some() {
-            panic!("mapping the current uid/gid requires a workspace with sub uid/gid mappings");
-        }
-        (None, None)
-    };
-
-    // Enter the user namespace and let children enter a new PID namespace.
-    // We cannot do mounts in this process yet, as this the process itself
-    // is not moved to the new PID namespace.
-    nix::sched::unshare(
-        nix::sched::CloneFlags::CLONE_NEWUSER | nix::sched::CloneFlags::CLONE_NEWPID,
-    )
-    .expect("failed to unshare()");
-
-    if workspace.sub_ids().is_some() {
-        setup_userns_with_helper(sock_main.unwrap().as_fd());
-        nix::sys::wait::waitpid(
-            helper_pid.expect("set{uid,gid}map helper PID must be known"),
-            None,
-        )
-        .expect("failed to wait for helper");
-    } else {
-        setup_userns_direct(&cfg, euid, egid);
     }
+}
 
+// Runs a supervisor process that spawns init (as yet another process)
+// and that cleans up afterwards.
+unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
     // Some configurations need a per-run directory to store temporary data.
-    // Note that cleanup of the per-run directory requires us to be in the user namespace
-    // (but this process is in the user namespace anyway).
+    // Note that cleanup of the per-run directory requires us to be in the user namespace.
     let need_tempdir = matches!(cfg.rootfs, Some(RootFs::Overlay { .. }));
     let run_tempdir: Option<tempfile::TempDir> = if need_tempdir {
         let run_root = workspace.run_dir();
@@ -662,25 +733,9 @@ pub fn run(cfg: Config, workspace: Workspace) {
     };
     let run_dir = run_tempdir.as_ref().map(|d| d.path());
 
-    // fork() and run init in the child.
-    // The parent waits for the child to terminate.
-    match unsafe { nix::unistd::fork() } {
-        Ok(nix::unistd::ForkResult::Child) => {
-            run_init(&cfg, &workspace, run_dir);
-        }
-        Ok(nix::unistd::ForkResult::Parent { child: init_pid }) => {
-            eprintln!("PID init is {} (outside the namespace)", init_pid);
-
-            // Wait for init to terminate.
-            let init_status =
-                nix::sys::wait::waitpid(init_pid, None).expect("failed to wait for init");
-            let init_code = match init_status {
-                nix::sys::wait::WaitStatus::Exited(_, code) => code,
-                _ => panic!("waiting for init returned {:?}", init_status),
-            };
-
-            exit(init_code);
-        }
-        Err(_) => panic!("failed to fork from cbuildrt"),
-    };
+    unsafe {
+        run_pidns(|| {
+            run_init(&cfg, workspace, run_dir);
+        })
+    }
 }

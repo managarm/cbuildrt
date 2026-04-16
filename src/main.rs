@@ -134,5 +134,6 @@ fn do_run_subcmd(workspace_path: Option<&Path>, cbuild_json: &Path) {
         None => Workspace::temporary(),
     };
 
-    run(cfg, workspace);
+    let exit_code = unsafe { run(cfg, workspace) };
+    std::process::exit(exit_code);
 }
