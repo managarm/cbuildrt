@@ -1,5 +1,5 @@
 use libc::{gid_t, uid_t};
-use nix::fcntl::{flock, open, FlockArg, OFlag};
+use nix::fcntl::{open, Flock, FlockArg, OFlag};
 use nix::sys::stat::Mode;
 use rustix::fd::AsFd;
 use serde::{Deserialize, Serialize};
@@ -683,7 +683,7 @@ unsafe fn run_pidns<F: FnOnce() -> Infallible>(f: F) -> i32 {
 }
 
 pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
-    if let Some(RootFs::Path(path)) = &cfg.rootfs {
+    let _rootfs_lock = if let Some(RootFs::Path(path)) = &cfg.rootfs {
         let lockfile_path = path
             .parent()
             .and_then(|p| Some(p.join(path.file_name()?)))
@@ -697,8 +697,14 @@ pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
         )
         .expect("couldn't open rootfs for locking");
 
-        flock(root_dir, FlockArg::LockShared).expect("failed to lock rootdir");
-    }
+        Some(
+            Flock::lock(root_dir, FlockArg::LockShared)
+                .map_err(|(_, e)| e)
+                .expect("failed to lock rootdir"),
+        )
+    } else {
+        None
+    };
 
     let map_to = cfg.map_current_user_to.as_ref().unwrap_or(&cfg.user);
     unsafe {
