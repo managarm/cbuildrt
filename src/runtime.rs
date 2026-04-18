@@ -1,15 +1,19 @@
 use libc::{gid_t, uid_t};
 use nix::fcntl::{open, Flock, FlockArg, OFlag};
+use nix::sys::signal::SigSet;
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::stat::Mode;
-use rustix::fd::AsFd;
+use rustix::event::{poll, PollFd, PollFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::File;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use crate::util::{termination_signal_set, SignalMaskGuard};
 use crate::workspace::Workspace;
 
 #[derive(Serialize, Deserialize)]
@@ -590,6 +594,62 @@ unsafe fn raw_clone(flags: libc::c_int) -> libc::pid_t {
     ret as libc::pid_t
 }
 
+// Wait for a child process. Terminate the child (with SIGTERM) if a termination signal becomes
+// pending for the current process. Note that this requires the caller to block the signal.
+// This function does *not* dequeue the termination signal from the current process.
+fn wait_and_forward_termination(child_pid: libc::pid_t, mask: &SigSet) -> i32 {
+    let child_pidfd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(child_pid).unwrap(),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .expect("failed to get pidfd for child process");
+    let sigfd = SignalFd::with_flags(mask, SfdFlags::SFD_CLOEXEC).expect("signalfd() failed");
+    let pidfd = child_pidfd.as_fd();
+
+    loop {
+        let mut fds = [
+            PollFd::new(&sigfd, PollFlags::IN),
+            PollFd::new(&pidfd, PollFlags::IN),
+        ];
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => panic!("poll() failed: {:?}", e),
+        }
+        let sigfd_ready = fds[0].revents().contains(PollFlags::IN);
+        let pidfd_ready = fds[1].revents().contains(PollFlags::IN);
+
+        if sigfd_ready {
+            match rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::TERM) {
+                Ok(_) => {}
+                Err(e) => {
+                    // Ignore ESRCH as the child has already terminated in that case.
+                    if e != rustix::io::Errno::SRCH {
+                        panic!("failed to signal child process: {:?}", e);
+                    }
+                }
+            }
+        }
+        if pidfd_ready {
+            break;
+        }
+    }
+
+    let status = rustix::process::waitid(
+        rustix::process::WaitId::PidFd(pidfd),
+        rustix::process::WaitIdOptions::EXITED,
+    )
+    .expect("waitid failed")
+    .expect("waitid returned no status despite ready pidfd");
+    if let Some(code) = status.exit_status() {
+        code
+    } else if let Some(sig) = status.terminating_signal() {
+        128 + sig
+    } else {
+        panic!("unexpected wait status: {:?}", status);
+    }
+}
+
 /// Run a callback inside a workspace's user namespace.
 ///
 /// # Safety
@@ -661,27 +721,6 @@ pub unsafe fn run_userns<F: FnOnce() -> Infallible>(
     }
 }
 
-/// Run a callback as PID 1 inside a new PID namespace.
-///
-/// # Safety
-/// The caller must ensure the current process is single-threaded.
-// TODO: Use ! as a return type instead of Infallible once it is stabilized.
-unsafe fn run_pidns<F: FnOnce() -> Infallible>(f: F) -> i32 {
-    let child_pid = raw_clone(libc::CLONE_NEWPID);
-    if child_pid == 0 {
-        f();
-        exit(0);
-    } else {
-        // Wait for child.
-        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(child_pid), None)
-            .expect("failed to wait for child");
-        match status {
-            nix::sys::wait::WaitStatus::Exited(_, code) => code,
-            _ => panic!("unexpected wait status: {:?}", status),
-        }
-    }
-}
-
 pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
     let _rootfs_lock = if let Some(RootFs::Path(path)) = &cfg.rootfs {
         let lockfile_path = path
@@ -723,6 +762,11 @@ pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
 // Runs a supervisor process that spawns init (as yet another process)
 // and that cleans up afterwards.
 unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
+    // We want to make sure that cleanup runs even if we receive SIGTERM etc.
+    // Block termination signals and kill the container PID 1 if we receive any signals.
+    let blocked = termination_signal_set();
+    let _mask_guard = SignalMaskGuard::block(&blocked);
+
     // Some configurations need a per-run directory to store temporary data.
     // Note that cleanup of the per-run directory requires us to be in the user namespace.
     let need_tempdir = matches!(cfg.rootfs, Some(RootFs::Overlay { .. }));
@@ -739,9 +783,13 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
     };
     let run_dir = run_tempdir.as_ref().map(|d| d.path());
 
-    unsafe {
-        run_pidns(|| {
-            run_init(&cfg, workspace, run_dir);
-        })
+    let child_pid = raw_clone(libc::CLONE_NEWPID);
+    if child_pid == 0 {
+        // Restore the default (= empty) signal mask in the child.
+        SigSet::empty().thread_set_mask().unwrap();
+
+        run_init(&cfg, workspace, run_dir);
     }
+
+    wait_and_forward_termination(child_pid, &blocked)
 }

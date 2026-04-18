@@ -7,6 +7,7 @@ use runtime::{run, Config};
 use workspace::{SubIds, Workspace};
 
 mod runtime;
+mod util;
 mod workspace;
 
 #[derive(Parser)]
