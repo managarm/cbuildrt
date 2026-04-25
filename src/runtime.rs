@@ -109,6 +109,8 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
         .prefix(".tmp-")
         .tempdir_in(&layers_root)
         .expect("failed to create staging dir for tar layer extraction");
+    std::os::unix::fs::chown(&staging, Some(0), Some(0))
+        .expect("failed to chown() overlay lower dir");
 
     let tar_file = File::open(path).expect("failed to open tar layer");
     let mut archive = tar::Archive::new(tar_file);
@@ -133,6 +135,8 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
         Some(RootFs::Overlay { .. }) => {
             let merged = run_dir.unwrap().join("merged");
             std::fs::create_dir(&merged).expect("failed to create overlay merged dir");
+            std::os::unix::fs::chown(&merged, Some(0), Some(0))
+                .expect("failed to chown() merged overlay dir");
             Some(merged)
         }
         None => None,
@@ -171,6 +175,10 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                 let work = run_dir.join("work");
                 std::fs::create_dir(&upper).expect("failed to create overlay upper dir");
                 std::fs::create_dir(&work).expect("failed to create overlay work dir");
+                std::os::unix::fs::chown(&upper, Some(0), Some(0))
+                    .expect("failed to chown() overlay upper dir");
+                std::os::unix::fs::chown(&work, Some(0), Some(0))
+                    .expect("failed to chown() overlay work dir");
                 rustix::mount::fsconfig_set_string(&mount, "upperdir", &upper)
                     .expect("failed to set overlay upperdir option");
                 rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
@@ -344,6 +352,7 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     for vol in &cfg.volumes {
         let source = workspace.volumes_dir().join(&vol.name);
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
+        std::os::unix::fs::chown(&source, Some(0), Some(0)).expect("failed to chown() volume dir");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
         std::fs::create_dir_all(&dest).expect("failed to create volume mount point");
         nix::mount::mount(
