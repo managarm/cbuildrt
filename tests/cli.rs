@@ -118,3 +118,60 @@ fn custom_environ() {
         .success()
         .stdout(predicate::str::contains("hello world"));
 }
+
+// Test if we can write to an overlayfs with an upper layer (with subuid/subgid).
+// This is a regression test for breakage when using certain AppArmor profiles.
+#[test]
+fn subid_overlay_writes() {
+    let ws = tempfile::tempdir().unwrap();
+    println!("workspace is at: {:?}", ws.path());
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    let lower = tempfile::tempdir().unwrap();
+    let extract = tempfile::Builder::new().suffix(".tar").tempfile().unwrap();
+
+    let config = serde_json::json!({
+        "user": { "uid": 0, "gid": 0 },
+        "process": { "args": ["touch", "hello"] },
+        "rootfs": {
+            "layers": [lower.path()],
+            "withUpper": true,
+            "extractUpper": extract.path(),
+        },
+        "noChroot": true,
+        "noSystemMounts": true,
+        "bindMounts": [],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .success();
+
+    let mut archive = tar::Archive::new(
+        std::fs::File::open(extract).expect("failed to open extracted upper tar"),
+    );
+    let found_file = archive
+        .entries()
+        .expect("failed to read tar entries")
+        .any(|e| {
+            let entry = e.expect("failed to read tar entry");
+            entry.path().unwrap().as_os_str() == "hello"
+        });
+    assert!(
+        found_file,
+        "file created by touch is not present in extracted upper dir"
+    );
+}
