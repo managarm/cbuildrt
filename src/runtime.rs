@@ -374,7 +374,6 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
         std::os::unix::fs::chown(&source, Some(0), Some(0)).expect("failed to chown() volume dir");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
-        std::fs::create_dir_all(&dest).expect("failed to create volume mount point");
         nix::mount::mount(
             Some(&source),
             &dest,
