@@ -52,6 +52,8 @@ enum RootFs {
         with_upper: bool,
         #[serde(default, rename = "extractUpper")]
         extract_upper: Option<PathBuf>,
+        #[serde(default, rename = "importUpper")]
+        import_upper: Option<PathBuf>,
     },
 }
 
@@ -153,9 +155,16 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     // Skip rootfs setup if we are running in namespace only mode.
     if let Some(rootfs) = rootfs {
         if let Some(RootFs::Overlay {
-            layers, with_upper, ..
+            layers,
+            with_upper,
+            import_upper,
+            ..
         }) = &cfg.rootfs
         {
+            if import_upper.is_some() && !with_upper {
+                panic!("importUpper requires withUpper to be set");
+            }
+
             let resolved_layers: Vec<PathBuf> = layers
                 .iter()
                 .map(|p| resolve_tar_layer(workspace, p))
@@ -179,6 +188,17 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     .expect("failed to chown() overlay upper dir");
                 std::os::unix::fs::chown(&work, Some(0), Some(0))
                     .expect("failed to chown() overlay work dir");
+
+                if let Some(import_path) = import_upper {
+                    let tar_file = File::open(import_path).expect("failed to open importUpper tar");
+                    let mut archive = tar::Archive::new(tar_file);
+                    archive.set_preserve_permissions(true);
+                    archive.set_preserve_ownerships(true);
+                    archive
+                        .unpack(&upper)
+                        .expect("failed to extract importUpper tar into upper dir");
+                }
+
                 rustix::mount::fsconfig_set_string(&mount, "upperdir", &upper)
                     .expect("failed to set overlay upperdir option");
                 rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
