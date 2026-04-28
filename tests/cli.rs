@@ -219,3 +219,75 @@ fn overlay_import_upper() {
         .assert()
         .success();
 }
+
+// Test that importUpper and extractUpper handle .tar.zstd archives in one round-trip.
+#[test]
+fn zstd_layer_storages() {
+    let lower = tempfile::tempdir().unwrap();
+
+    // Build a zstd-compressed tar containing a single file.
+    let import_tar = tempfile::Builder::new()
+        .suffix(".tar.zstd")
+        .tempfile()
+        .unwrap();
+    {
+        let zstd_file = std::fs::File::create(import_tar.path()).unwrap();
+        let encoder = zstd::stream::write::Encoder::new(zstd_file, 0)
+            .unwrap()
+            .auto_finish();
+        let mut builder = tar::Builder::new(encoder);
+        let data = b"world\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("hello").unwrap();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder.append(&header, &data[..]).unwrap();
+        builder.finish().unwrap();
+    }
+
+    let extract = tempfile::Builder::new()
+        .suffix(".tar.zstd")
+        .tempfile()
+        .unwrap();
+
+    let config = serde_json::json!({
+        "user": { "uid": 0, "gid": 0 },
+        "process": { "args": ["mv", "hello", "hello.moved"] },
+        "rootfs": {
+            "layers": [lower.path()],
+            "withUpper": true,
+            "importUpper": &import_tar.path(),
+            "extractUpper": &extract.path(),
+        },
+        "noChroot": true,
+        "noSystemMounts": true,
+        "bindMounts": [],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .success();
+
+    // Read back the extracted .tar.zstd.
+    let decoder =
+        zstd::stream::read::Decoder::new(std::fs::File::open(&extract.path()).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    let found_file = archive
+        .entries()
+        .expect("failed to read tar entries")
+        .any(|e| {
+            let entry = e.expect("failed to read tar entry");
+            entry.path().unwrap().as_os_str() == "hello.moved"
+        });
+    assert!(
+        found_file,
+        "file created by mv is not present in extracted upper dir"
+    );
+}

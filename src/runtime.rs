@@ -13,7 +13,10 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::util::{termination_signal_set, SignalMaskGuard};
+use crate::util::{
+    classify_archive, open_tar_reader, open_tar_writer, termination_signal_set, ArchiveKind,
+    SignalMaskGuard,
+};
 use crate::workspace::Workspace;
 
 #[derive(Serialize, Deserialize)]
@@ -91,14 +94,10 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
 }
 
 fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
-    let ext = path.extension().and_then(|e| e.to_str());
-    if ext != Some("tar") {
+    let (kind, stem) = classify_archive(path);
+    if matches!(kind, ArchiveKind::Plain) {
         return path.to_path_buf();
     }
-
-    let stem = path
-        .file_stem()
-        .expect("filename of tar lower layer has empty prefix");
 
     let layers_root = workspace.layers_dir();
 
@@ -117,8 +116,8 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
     std::os::unix::fs::chown(&staging, Some(0), Some(0))
         .expect("failed to chown() overlay lower dir");
 
-    let tar_file = File::open(path).expect("failed to open tar layer");
-    let mut archive = tar::Archive::new(tar_file);
+    let reader = open_tar_reader(path, &kind);
+    let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive
@@ -268,8 +267,9 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     .expect("failed to chown() overlay work dir");
 
                 if let Some(import_path) = import_upper {
-                    let tar_file = File::open(import_path).expect("failed to open importUpper tar");
-                    let mut archive = tar::Archive::new(tar_file);
+                    let (kind, _) = classify_archive(import_path);
+                    let reader = open_tar_reader(import_path, &kind);
+                    let mut archive = tar::Archive::new(reader);
                     archive.set_preserve_permissions(true);
                     archive.set_preserve_ownerships(true);
                     archive
@@ -508,8 +508,9 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     let upper = run_dir
                         .expect("extractUpper is set but no overlay tempdir was provided")
                         .join("upper");
-                    let tar_file = File::create(dest).expect("failed to create output tar file");
-                    let mut builder = tar::Builder::new(tar_file);
+                    let (kind, _) = classify_archive(dest);
+                    let writer = open_tar_writer(dest, &kind);
+                    let mut builder = tar::Builder::new(writer);
                     builder.follow_symlinks(false);
                     builder
                         .append_dir_all(".", upper)
