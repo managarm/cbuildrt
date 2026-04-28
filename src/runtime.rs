@@ -68,6 +68,9 @@ pub struct Config {
     process: Process,
     #[serde(default)]
     isolate_network: bool,
+    // Provide a /dev fs instead of relying on the device placerholders on the rootfs.
+    #[serde(default)]
+    provide_dev: bool,
     bind_mounts: Vec<BindMount>,
     #[serde(default)]
     volumes: Vec<Volume>,
@@ -128,6 +131,81 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
         .expect("failed to move extracted tar layer into cache");
 
     extracted_dir
+}
+
+fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
+    let subdirs = ["pts", "shm"];
+
+    let devices = ["tty", "null", "zero", "full", "random", "urandom"];
+
+    if provide_dev {
+        // We put /dev onto the host filesystem since mounting a tmpfs inside the user namespace
+        // behaves differently compared to a bind mounted host directory.
+        // In particular, opening bind mounted devices on such a tmpfs with O_CREAT fails with EACCES.
+        let skeleton = run_dir.expect("provide_dev requires run_dir").join("dev");
+        std::fs::create_dir(&skeleton).expect("failed to create dev dir");
+
+        // Create contents of /dev.
+        let symlinks = [
+            ("fd", "/proc/self/fd"),
+            ("ptmx", "pts/ptmx"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ];
+
+        for d in &subdirs {
+            std::fs::create_dir(skeleton.join(d)).expect("failed to create /dev subdirectory");
+        }
+        for f in &devices {
+            File::create(skeleton.join(f)).expect("failed to create /dev device placeholder");
+        }
+        for (link, target) in &symlinks {
+            std::os::unix::fs::symlink(target, skeleton.join(link))
+                .expect("failed to create /dev symlink");
+        }
+
+        // Mount /dev.
+        nix::mount::mount(
+            Some(&skeleton),
+            &concat_absolute(rootfs, "/dev"),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to bind mount dev dir");
+    }
+
+    // Mount subdirectories.
+    nix::mount::mount(
+        None::<&str>,
+        &concat_absolute(rootfs, "/dev/pts"),
+        Some("devpts"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("failed to mount /dev/pts");
+
+    nix::mount::mount(
+        None::<&str>,
+        &concat_absolute(rootfs, "/dev/shm"),
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("failed to mount /dev/shm");
+
+    // Mount devices.
+    for f in &devices {
+        nix::mount::mount(
+            Some(&Path::new("/dev/").join(f)),
+            &concat_absolute(rootfs, "/dev/").join(f),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to bind mount device");
+    }
 }
 
 fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
@@ -255,17 +333,7 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
 
         // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp, /var/tmp, /sys, and /proc.
         if !cfg.no_system_mounts {
-            let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
-            for f in dev_overlays {
-                nix::mount::mount(
-                    Some(&Path::new("/dev/").join(f)),
-                    &concat_absolute(rootfs, "/dev/").join(f),
-                    None::<&str>,
-                    nix::mount::MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .expect("failed to mount device");
-            }
+            setup_dev(rootfs, cfg.provide_dev, run_dir);
 
             if !cfg.isolate_network {
                 nix::mount::mount(
@@ -277,24 +345,6 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                 )
                 .expect("failed to mount /etc/resolv.conf");
             }
-
-            nix::mount::mount(
-                None::<&str>,
-                &concat_absolute(rootfs, "/dev/pts"),
-                Some("devpts"),
-                nix::mount::MsFlags::empty(),
-                None::<&str>,
-            )
-            .expect("failed to mount /dev/pts");
-
-            nix::mount::mount(
-                None::<&str>,
-                &concat_absolute(rootfs, "/dev/shm"),
-                Some("tmpfs"),
-                nix::mount::MsFlags::empty(),
-                None::<&str>,
-            )
-            .expect("failed to mount /dev/shm");
 
             nix::mount::mount(
                 None::<&str>,
