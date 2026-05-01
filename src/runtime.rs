@@ -13,7 +13,10 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::util::{termination_signal_set, SignalMaskGuard};
+use crate::util::{
+    classify_archive, open_tar_reader, open_tar_writer, termination_signal_set, ArchiveKind,
+    SignalMaskGuard,
+};
 use crate::workspace::Workspace;
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +55,8 @@ enum RootFs {
         with_upper: bool,
         #[serde(default, rename = "extractUpper")]
         extract_upper: Option<PathBuf>,
+        #[serde(default, rename = "importUpper")]
+        import_upper: Option<PathBuf>,
     },
 }
 
@@ -66,6 +71,9 @@ pub struct Config {
     process: Process,
     #[serde(default)]
     isolate_network: bool,
+    // Provide a /dev fs instead of relying on the device placerholders on the rootfs.
+    #[serde(default)]
+    provide_dev: bool,
     bind_mounts: Vec<BindMount>,
     #[serde(default)]
     volumes: Vec<Volume>,
@@ -86,14 +94,10 @@ fn concat_absolute<L: AsRef<Path>, R: AsRef<Path>>(lhs: L, rhs: R) -> PathBuf {
 }
 
 fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
-    let ext = path.extension().and_then(|e| e.to_str());
-    if ext != Some("tar") {
+    let (kind, stem) = classify_archive(path);
+    if matches!(kind, ArchiveKind::Plain) {
         return path.to_path_buf();
     }
-
-    let stem = path
-        .file_stem()
-        .expect("filename of tar lower layer has empty prefix");
 
     let layers_root = workspace.layers_dir();
 
@@ -109,9 +113,11 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
         .prefix(".tmp-")
         .tempdir_in(&layers_root)
         .expect("failed to create staging dir for tar layer extraction");
+    std::os::unix::fs::chown(&staging, Some(0), Some(0))
+        .expect("failed to chown() overlay lower dir");
 
-    let tar_file = File::open(path).expect("failed to open tar layer");
-    let mut archive = tar::Archive::new(tar_file);
+    let reader = open_tar_reader(path, &kind);
+    let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive
@@ -126,6 +132,81 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
     extracted_dir
 }
 
+fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
+    let subdirs = ["pts", "shm"];
+
+    let devices = ["tty", "null", "zero", "full", "random", "urandom"];
+
+    if provide_dev {
+        // We put /dev onto the host filesystem since mounting a tmpfs inside the user namespace
+        // behaves differently compared to a bind mounted host directory.
+        // In particular, opening bind mounted devices on such a tmpfs with O_CREAT fails with EACCES.
+        let skeleton = run_dir.expect("provide_dev requires run_dir").join("dev");
+        std::fs::create_dir(&skeleton).expect("failed to create dev dir");
+
+        // Create contents of /dev.
+        let symlinks = [
+            ("fd", "/proc/self/fd"),
+            ("ptmx", "pts/ptmx"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ];
+
+        for d in &subdirs {
+            std::fs::create_dir(skeleton.join(d)).expect("failed to create /dev subdirectory");
+        }
+        for f in &devices {
+            File::create(skeleton.join(f)).expect("failed to create /dev device placeholder");
+        }
+        for (link, target) in &symlinks {
+            std::os::unix::fs::symlink(target, skeleton.join(link))
+                .expect("failed to create /dev symlink");
+        }
+
+        // Mount /dev.
+        nix::mount::mount(
+            Some(&skeleton),
+            &concat_absolute(rootfs, "/dev"),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to bind mount dev dir");
+    }
+
+    // Mount subdirectories.
+    nix::mount::mount(
+        None::<&str>,
+        &concat_absolute(rootfs, "/dev/pts"),
+        Some("devpts"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("failed to mount /dev/pts");
+
+    nix::mount::mount(
+        None::<&str>,
+        &concat_absolute(rootfs, "/dev/shm"),
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("failed to mount /dev/shm");
+
+    // Mount devices.
+    for f in &devices {
+        nix::mount::mount(
+            Some(&Path::new("/dev/").join(f)),
+            &concat_absolute(rootfs, "/dev/").join(f),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("failed to bind mount device");
+    }
+}
+
 fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     // Derive the rootfs path.
     let rootfs_owned: Option<PathBuf> = match &cfg.rootfs {
@@ -133,6 +214,8 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
         Some(RootFs::Overlay { .. }) => {
             let merged = run_dir.unwrap().join("merged");
             std::fs::create_dir(&merged).expect("failed to create overlay merged dir");
+            std::os::unix::fs::chown(&merged, Some(0), Some(0))
+                .expect("failed to chown() merged overlay dir");
             Some(merged)
         }
         None => None,
@@ -149,9 +232,16 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     // Skip rootfs setup if we are running in namespace only mode.
     if let Some(rootfs) = rootfs {
         if let Some(RootFs::Overlay {
-            layers, with_upper, ..
+            layers,
+            with_upper,
+            import_upper,
+            ..
         }) = &cfg.rootfs
         {
+            if import_upper.is_some() && !with_upper {
+                panic!("importUpper requires withUpper to be set");
+            }
+
             let resolved_layers: Vec<PathBuf> = layers
                 .iter()
                 .map(|p| resolve_tar_layer(workspace, p))
@@ -171,6 +261,22 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                 let work = run_dir.join("work");
                 std::fs::create_dir(&upper).expect("failed to create overlay upper dir");
                 std::fs::create_dir(&work).expect("failed to create overlay work dir");
+                std::os::unix::fs::chown(&upper, Some(0), Some(0))
+                    .expect("failed to chown() overlay upper dir");
+                std::os::unix::fs::chown(&work, Some(0), Some(0))
+                    .expect("failed to chown() overlay work dir");
+
+                if let Some(import_path) = import_upper {
+                    let (kind, _) = classify_archive(import_path);
+                    let reader = open_tar_reader(import_path, &kind);
+                    let mut archive = tar::Archive::new(reader);
+                    archive.set_preserve_permissions(true);
+                    archive.set_preserve_ownerships(true);
+                    archive
+                        .unpack(&upper)
+                        .expect("failed to extract importUpper tar into upper dir");
+                }
+
                 rustix::mount::fsconfig_set_string(&mount, "upperdir", &upper)
                     .expect("failed to set overlay upperdir option");
                 rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
@@ -227,17 +333,7 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
 
         // Perform mounts of /dev, /dev/pts, /dev/shm, /run, /tmp, /var/tmp, /sys, and /proc.
         if !cfg.no_system_mounts {
-            let dev_overlays = vec!["tty", "null", "zero", "full", "random", "urandom"];
-            for f in dev_overlays {
-                nix::mount::mount(
-                    Some(&Path::new("/dev/").join(f)),
-                    &concat_absolute(rootfs, "/dev/").join(f),
-                    None::<&str>,
-                    nix::mount::MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .expect("failed to mount device");
-            }
+            setup_dev(rootfs, cfg.provide_dev, run_dir);
 
             if !cfg.isolate_network {
                 nix::mount::mount(
@@ -249,24 +345,6 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                 )
                 .expect("failed to mount /etc/resolv.conf");
             }
-
-            nix::mount::mount(
-                None::<&str>,
-                &concat_absolute(rootfs, "/dev/pts"),
-                Some("devpts"),
-                nix::mount::MsFlags::empty(),
-                None::<&str>,
-            )
-            .expect("failed to mount /dev/pts");
-
-            nix::mount::mount(
-                None::<&str>,
-                &concat_absolute(rootfs, "/dev/shm"),
-                Some("tmpfs"),
-                nix::mount::MsFlags::empty(),
-                None::<&str>,
-            )
-            .expect("failed to mount /dev/shm");
 
             nix::mount::mount(
                 None::<&str>,
@@ -344,8 +422,8 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
     for vol in &cfg.volumes {
         let source = workspace.volumes_dir().join(&vol.name);
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
+        std::os::unix::fs::chown(&source, Some(0), Some(0)).expect("failed to chown() volume dir");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
-        std::fs::create_dir_all(&dest).expect("failed to create volume mount point");
         nix::mount::mount(
             Some(&source),
             &dest,
@@ -430,8 +508,9 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     let upper = run_dir
                         .expect("extractUpper is set but no overlay tempdir was provided")
                         .join("upper");
-                    let tar_file = File::create(dest).expect("failed to create output tar file");
-                    let mut builder = tar::Builder::new(tar_file);
+                    let (kind, _) = classify_archive(dest);
+                    let writer = open_tar_writer(dest, &kind);
+                    let mut builder = tar::Builder::new(writer);
                     builder.follow_symlinks(false);
                     builder
                         .append_dir_all(".", upper)

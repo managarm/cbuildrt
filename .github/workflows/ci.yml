@@ -9,10 +9,15 @@ jobs:
         steps:
           - name: Install prerequisites
             run: |
+                sudo apt-get update
+                sudo apt-get install -y musl-tools
                 rustup target add x86_64-unknown-linux-musl
           - name: Checkout
             uses: actions/checkout@v2
           - name: Build using Cargo
+            env:
+                CC_x86_64_unknown_linux_musl: musl-gcc
+                CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
             run: |
                 cargo build --release --target x86_64-unknown-linux-musl
           - name: Publish artifact
@@ -20,6 +25,20 @@ jobs:
             with:
                 name: cbuildrt-linux-x86_64
                 path: target/x86_64-unknown-linux-musl/release/cbuildrt
+
+    test:
+        name: Test cbuildrt
+        runs-on: ubuntu-24.04
+        steps:
+          - name: Checkout
+            uses: actions/checkout@v2
+          - name: Allow unprivileged user namespaces
+            run: |
+                sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+                sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          - name: Run cargo test
+            run: |
+                cargo test
 
     deploy:
         name: Publish release
