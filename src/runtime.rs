@@ -136,6 +136,12 @@ fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
     let subdirs = ["pts", "shm"];
 
     let devices = ["tty", "null", "zero", "full", "random", "urandom"];
+    // Devices that are only provided if the host has them.
+    let optional_devices: Vec<&str> = ["fuse", "kvm"]
+        .iter()
+        .copied()
+        .filter(|d| Path::new("/dev").join(d).exists())
+        .collect();
 
     if provide_dev {
         // We put /dev onto the host filesystem since mounting a tmpfs inside the user namespace
@@ -157,6 +163,9 @@ fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
             std::fs::create_dir(skeleton.join(d)).expect("failed to create /dev subdirectory");
         }
         for f in &devices {
+            File::create(skeleton.join(f)).expect("failed to create /dev device placeholder");
+        }
+        for f in &optional_devices {
             File::create(skeleton.join(f)).expect("failed to create /dev device placeholder");
         }
         for (link, target) in &symlinks {
@@ -204,6 +213,20 @@ fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
             None::<&str>,
         )
         .expect("failed to bind mount device");
+    }
+
+    // Optional devices only have placeholders when we provide /dev ourselves.
+    if provide_dev {
+        for f in &optional_devices {
+            nix::mount::mount(
+                Some(&Path::new("/dev/").join(f)),
+                &concat_absolute(rootfs, "/dev/").join(f),
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .expect("failed to bind mount device");
+        }
     }
 }
 
