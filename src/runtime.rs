@@ -132,7 +132,7 @@ fn resolve_tar_layer(workspace: &Workspace, path: &Path) -> PathBuf {
     extracted_dir
 }
 
-fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
+fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: &Path) {
     let subdirs = ["pts", "shm"];
 
     let devices = ["tty", "null", "zero", "full", "random", "urandom"];
@@ -147,7 +147,7 @@ fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
         // We put /dev onto the host filesystem since mounting a tmpfs inside the user namespace
         // behaves differently compared to a bind mounted host directory.
         // In particular, opening bind mounted devices on such a tmpfs with O_CREAT fails with EACCES.
-        let skeleton = run_dir.expect("provide_dev requires run_dir").join("dev");
+        let skeleton = run_dir.join("dev");
         std::fs::create_dir(&skeleton).expect("failed to create dev dir");
 
         // Create contents of /dev.
@@ -230,12 +230,12 @@ fn setup_dev(rootfs: &Path, provide_dev: bool, run_dir: Option<&Path>) {
     }
 }
 
-fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
+fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
     // Derive the rootfs path.
     let rootfs_owned: Option<PathBuf> = match &cfg.rootfs {
         Some(RootFs::Path(path)) => Some(path.clone()),
         Some(RootFs::Overlay { .. }) => {
-            let merged = run_dir.unwrap().join("merged");
+            let merged = run_dir.join("merged");
             std::fs::create_dir(&merged).expect("failed to create overlay merged dir");
             std::os::unix::fs::chown(&merged, Some(0), Some(0))
                 .expect("failed to chown() merged overlay dir");
@@ -278,8 +278,6 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     .expect("failed to set overlay lowerdir option");
             }
             if *with_upper {
-                let run_dir =
-                    run_dir.expect("withUpper is set but no overlay tempdir was provided");
                 let upper = run_dir.join("upper");
                 let work = run_dir.join("work");
                 std::fs::create_dir(&upper).expect("failed to create overlay upper dir");
@@ -528,9 +526,7 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: Option<&Path>) -> ! {
                     ..
                 }) = &cfg.rootfs
                 {
-                    let upper = run_dir
-                        .expect("extractUpper is set but no overlay tempdir was provided")
-                        .join("upper");
+                    let upper = run_dir.join("upper");
                     let (kind, _) = classify_archive(dest);
                     let writer = open_tar_writer(dest, &kind);
                     let mut builder = tar::Builder::new(writer);
@@ -869,21 +865,33 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
     let blocked = termination_signal_set();
     let _mask_guard = SignalMaskGuard::block(&blocked);
 
-    // Some configurations need a per-run directory to store temporary data.
+    // Create a per-run directory for temporary data (overlay merged/upper/work dirs, /dev skeleton).
     // Note that cleanup of the per-run directory requires us to be in the user namespace.
-    let need_tempdir = matches!(cfg.rootfs, Some(RootFs::Overlay { .. }));
-    let run_tempdir: Option<tempfile::TempDir> = if need_tempdir {
+    //
+    // In cases where the data is small (i.e., no upper layer), we create this in /tmp (= hopefully a tmpfs).
+    // TODO: Add a way to override the run_dir root or look at $XDG_RUNTIME_DIR / $RUNTIME_DIRECTORY.
+    let stores_upper = matches!(
+        cfg.rootfs,
+        Some(RootFs::Overlay {
+            with_upper: true,
+            ..
+        })
+    );
+    let run_tempdir = if stores_upper {
         let run_root = workspace.run_dir();
         std::fs::create_dir_all(&run_root)
-            .expect("failed to create cbuildrt overlay cache directory");
-        let dir = tempfile::Builder::new()
+            .expect("failed to create cbuildrt per-run cache directory");
+        tempfile::Builder::new()
             .tempdir_in(&run_root)
-            .expect("failed to create per-run overlay tempdir");
-        Some(dir)
+            .expect("failed to create per-run tempdir")
     } else {
-        None
+        // The system temporary directory is shared, so use a recognizable prefix.
+        tempfile::Builder::new()
+            .prefix("cbuildrt-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("failed to create per-run tempdir")
     };
-    let run_dir = run_tempdir.as_ref().map(|d| d.path());
+    let run_dir = run_tempdir.path();
 
     let child_pid = raw_clone(libc::CLONE_NEWPID);
     if child_pid == 0 {
