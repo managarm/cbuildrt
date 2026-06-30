@@ -867,13 +867,30 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
 
     // Create a per-run directory for temporary data (overlay merged/upper/work dirs, /dev skeleton).
     // Note that cleanup of the per-run directory requires us to be in the user namespace.
-    // TODO: In cases where the stored data is small (e.g., no upper layer),
-    //       we could move this to a tmpfs (i.e., to /tmp or $XDG_RUNTIME_DIR).
-    let run_root = workspace.run_dir();
-    std::fs::create_dir_all(&run_root).expect("failed to create cbuildrt per-run cache directory");
-    let run_tempdir = tempfile::Builder::new()
-        .tempdir_in(&run_root)
-        .expect("failed to create per-run tempdir");
+    //
+    // In cases where the data is small (i.e., no upper layer), we create this in /tmp (= hopefully a tmpfs).
+    // TODO: Add a way to override the run_dir root or look at $XDG_RUNTIME_DIR / $RUNTIME_DIRECTORY.
+    let stores_upper = matches!(
+        cfg.rootfs,
+        Some(RootFs::Overlay {
+            with_upper: true,
+            ..
+        })
+    );
+    let run_tempdir = if stores_upper {
+        let run_root = workspace.run_dir();
+        std::fs::create_dir_all(&run_root)
+            .expect("failed to create cbuildrt per-run cache directory");
+        tempfile::Builder::new()
+            .tempdir_in(&run_root)
+            .expect("failed to create per-run tempdir")
+    } else {
+        // The system temporary directory is shared, so use a recognizable prefix.
+        tempfile::Builder::new()
+            .prefix("cbuildrt-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("failed to create per-run tempdir")
+    };
     let run_dir = run_tempdir.path();
 
     let child_pid = raw_clone(libc::CLONE_NEWPID);
