@@ -291,3 +291,26 @@ fn zstd_layer_storages() {
         "file created by mv is not present in extracted upper dir"
     );
 }
+
+// Volume names that would escape the volumes directory must be rejected.
+#[test]
+fn run_invalid_volume_name() {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let dest = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "user": { "uid": uid, "gid": gid },
+        "process": { "args": ["true"] },
+        "bindMounts": [],
+        "volumes": [{ "name": "..", "destination": dest.path() }],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .args(["run"])
+        .arg(f.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid volume name"));
+}

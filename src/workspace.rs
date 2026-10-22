@@ -125,6 +125,13 @@ impl Workspace {
         self.root.join("volumes")
     }
 
+    pub fn volume_path(&self, name: &str) -> PathBuf {
+        if !is_valid_volume_name(name) {
+            panic!("invalid volume name '{}'", name);
+        }
+        self.volumes_dir().join(name)
+    }
+
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
     }
@@ -145,6 +152,11 @@ impl Workspace {
             }
         }
     }
+}
+
+// Volume names must not escape the volumes directory.
+pub fn is_valid_volume_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
 }
 
 fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {
