@@ -441,7 +441,7 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
 
     // Perform volume mounts.
     for vol in &cfg.volumes {
-        let source = workspace.volumes_dir().join(&vol.name);
+        let source = workspace.volume_path(&vol.name);
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
         std::os::unix::fs::chown(&source, Some(0), Some(0)).expect("failed to chown() volume dir");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);

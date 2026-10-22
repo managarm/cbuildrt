@@ -125,6 +125,13 @@ impl Workspace {
         self.root.join("volumes")
     }
 
+    pub fn volume_path(&self, name: &str) -> PathBuf {
+        if !is_valid_volume_name(name) {
+            panic!("invalid volume name '{}'", name);
+        }
+        self.volumes_dir().join(name)
+    }
+
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
     }
@@ -145,6 +152,38 @@ impl Workspace {
             }
         }
     }
+
+    pub fn list_volumes(&self) -> Vec<String> {
+        let volumes_dir = self.volumes_dir();
+        let mut names = Vec::new();
+        if volumes_dir.exists() {
+            for entry in std::fs::read_dir(&volumes_dir).expect("failed to read volumes directory")
+            {
+                let entry = entry.expect("failed to read directory entry");
+                if entry.path().is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    // Removes a volume directory. The volume contents are owned by the subordinate ID range,
+    // so this must be called from inside the workspace's user namespace (see run_userns()).
+    pub fn remove_volume(&self, name: &str) {
+        let path = self.volume_path(name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("failed to remove volume directory");
+        }
+    }
+}
+
+// Volume names must not escape the volumes directory.
+pub fn is_valid_volume_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
 }
 
 fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {

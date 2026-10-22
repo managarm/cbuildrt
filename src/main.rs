@@ -35,6 +35,28 @@ enum Command {
     Run(RunCommandArgs),
     /// Purge extracted layers from the workspace
     Purge,
+    /// Manage persistent volumes in the workspace
+    Volume(VolumeCommandArgs),
+}
+
+#[derive(Args)]
+struct VolumeCommandArgs {
+    #[command(subcommand)]
+    command: VolumeCommand,
+}
+
+#[derive(Subcommand)]
+enum VolumeCommand {
+    /// List volumes in the workspace
+    Ls,
+    /// Remove a volume from the workspace
+    Rm(VolumeRmArgs),
+}
+
+#[derive(Args)]
+struct VolumeRmArgs {
+    /// Name of the volume to remove
+    name: String,
 }
 
 #[derive(Args)]
@@ -88,6 +110,9 @@ fn main() {
         }
         Some(Command::Purge) => {
             do_purge_subcmd(cli.workspace.as_deref());
+        }
+        Some(Command::Volume(args)) => {
+            do_volume_subcmd(cli.workspace.as_deref(), &args);
         }
         None => {
             let cbuild_json = cli.cbuild_json.unwrap_or_else(|| {
@@ -149,6 +174,42 @@ fn do_purge_subcmd(workspace_path: Option<&Path>) {
         })
     };
     exit(exit_code);
+}
+
+fn do_volume_subcmd(workspace_path: Option<&Path>, args: &VolumeCommandArgs) {
+    let workspace_path = workspace_path.unwrap_or_else(|| {
+        Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--workspace is required for volume",
+            )
+            .exit();
+    });
+    let workspace = Workspace::load(workspace_path);
+    match &args.command {
+        VolumeCommand::Ls => {
+            for name in workspace.list_volumes() {
+                println!("{}", name);
+            }
+        }
+        VolumeCommand::Rm(rm) => {
+            if !workspace::is_valid_volume_name(&rm.name) {
+                Cli::command()
+                    .error(
+                        ErrorKind::InvalidValue,
+                        format!("invalid volume name '{}'", rm.name),
+                    )
+                    .exit();
+            }
+            let exit_code = unsafe {
+                runtime::run_userns(&workspace, None, None, || {
+                    workspace.remove_volume(&rm.name);
+                    exit(0);
+                })
+            };
+            exit(exit_code);
+        }
+    }
 }
 
 fn do_run_subcmd(workspace_path: Option<&Path>, cbuild_json: &Path) {
