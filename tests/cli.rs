@@ -314,3 +314,55 @@ fn run_invalid_volume_name() {
         .failure()
         .stderr(predicate::str::contains("invalid volume name"));
 }
+
+// Test that volumes can be listed and removed, including contents owned by subordinate IDs.
+#[test]
+fn volume_ls_rm() {
+    let ws = tempfile::tempdir().unwrap();
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    let dest = tempfile::tempdir().unwrap();
+    let file = dest.path().join("hello");
+    let config = serde_json::json!({
+        "user": { "uid": 0, "gid": 0 },
+        "process": {
+            "args": ["sh", "-c", format!("touch {0} && chown 1:1 {0}", file.display())],
+        },
+        "bindMounts": [],
+        "volumes": [{ "name": "vol", "destination": dest.path() }],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .success();
+    assert!(ws.path().join("volumes/vol/hello").exists());
+
+    let volume_cmd = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("cbuildrt").unwrap();
+        cmd.arg("--workspace")
+            .arg(ws.path())
+            .arg("volume")
+            .args(args);
+        cmd.assert()
+    };
+    volume_cmd(&["ls"]).success().stdout("vol\n");
+    volume_cmd(&["rm", "vol"]).success();
+    volume_cmd(&["ls"]).success().stdout("");
+    assert!(!ws.path().join("volumes/vol").exists());
+
+    // Removing a non-existent volume succeeds but invalid names are rejected.
+    volume_cmd(&["rm", "vol"]).success();
+    volume_cmd(&["rm", ".."]).failure();
+}
