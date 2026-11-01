@@ -366,3 +366,87 @@ fn volume_ls_rm() {
     volume_cmd(&["rm", "vol"]).success();
     volume_cmd(&["rm", ".."]).failure();
 }
+
+// Test that volumes without a name start out empty and are removed when the container exits,
+// including contents owned by subordinate IDs and if the container fails.
+#[test]
+fn nameless_volume() {
+    let ws = tempfile::tempdir().unwrap();
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    let volume = tempfile::tempdir().unwrap();
+    let run_dir = ws.path().join("run");
+    let run_script = |script: &str| {
+        let config = serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": {
+                "args": ["sh", "-ec", script],
+                "environ": { "VOLUME": volume.path(), "RUN_DIR": run_dir },
+            },
+            "bindMounts": [],
+            "volumes": [{ "destination": volume.path() }],
+        });
+        let f = write_config(&config);
+
+        Command::cargo_bin("cbuildrt")
+            .unwrap()
+            .arg("--workspace")
+            .arg(ws.path())
+            .arg("run")
+            .arg(f.path())
+            .assert()
+    };
+    let assert_removed = || {
+        // The mount is private to the container, so the destination stays empty.
+        assert_eq!(std::fs::read_dir(volume.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&run_dir).unwrap().count(), 0);
+    };
+
+    run_script(
+        r#"
+        test -n "$(ls -A "$RUN_DIR")"
+        touch "$VOLUME/hello"
+        chown 1:1 "$VOLUME/hello"
+        "#,
+    )
+    .success();
+    assert_removed();
+
+    run_script(
+        r#"
+        test ! -e "$VOLUME/hello"
+        touch "$VOLUME/hello"
+        chown 1:1 "$VOLUME/hello"
+        exit 42
+        "#,
+    )
+    .code(42);
+    assert_removed();
+}
+
+// A misspelled name must not silently turn a persistent volume into a nameless one.
+#[test]
+fn run_unknown_volume_field() {
+    let dest = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "user": { "uid": 0, "gid": 0 },
+        "process": { "args": ["true"] },
+        "bindMounts": [],
+        "volumes": [{ "nmae": "vol", "destination": dest.path() }],
+    });
+    let f = write_config(&config);
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown field"));
+}
