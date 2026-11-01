@@ -25,9 +25,11 @@ struct BindMount {
     source: PathBuf,
 }
 
+// Volumes without a name start out empty and are removed when the container exits.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Volume {
-    name: String,
+    name: Option<String>,
     destination: PathBuf,
 }
 
@@ -439,9 +441,12 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
         .expect("failed to perform bind mount");
     }
 
-    // Perform volume mounts.
-    for vol in &cfg.volumes {
-        let source = workspace.volume_path(&vol.name);
+    // Perform volume mounts. The supervisor removes run_dir and thus the volumes without a name.
+    for (i, vol) in cfg.volumes.iter().enumerate() {
+        let source = match &vol.name {
+            Some(name) => workspace.volume_path(name),
+            None => run_dir.join(format!("volume-{}", i)),
+        };
         std::fs::create_dir_all(&source).expect("failed to create volume directory");
         std::os::unix::fs::chown(&source, Some(0), Some(0)).expect("failed to chown() volume dir");
         let dest = concat_absolute(rootfs.unwrap_or(Path::new("/")), &vol.destination);
@@ -868,7 +873,7 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
     // Create a per-run directory for temporary data (overlay merged/upper/work dirs, /dev skeleton).
     // Note that cleanup of the per-run directory requires us to be in the user namespace.
     //
-    // In cases where the data is small (i.e., no upper layer), we create this in /tmp (= hopefully a tmpfs).
+    // In cases where the data is small (i.e., no upper layer or volumes without a name), we create this in /tmp (= hopefully a tmpfs).
     // TODO: Add a way to override the run_dir root or look at $XDG_RUNTIME_DIR / $RUNTIME_DIRECTORY.
     let stores_upper = matches!(
         cfg.rootfs,
@@ -877,7 +882,8 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
             ..
         })
     );
-    let run_tempdir = if stores_upper {
+    let stores_volumes = cfg.volumes.iter().any(|vol| vol.name.is_none());
+    let run_tempdir = if stores_upper || stores_volumes {
         let run_root = workspace.run_dir();
         std::fs::create_dir_all(&run_root)
             .expect("failed to create cbuildrt per-run cache directory");
