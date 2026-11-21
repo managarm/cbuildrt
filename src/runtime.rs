@@ -73,6 +73,9 @@ enum RootFs {
         extract_upper: Option<PathBuf>,
         #[serde(default, rename = "importUpper")]
         import_upper: Option<PathBuf>,
+        // Name of a workspace layer that the upper layer becomes if the process succeeds.
+        #[serde(default, rename = "commitUpper")]
+        commit_upper: Option<String>,
     },
 }
 
@@ -866,6 +869,26 @@ pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
         None
     };
 
+    if let Some(RootFs::Overlay {
+        with_upper,
+        commit_upper: Some(name),
+        ..
+    }) = &cfg.rootfs
+    {
+        if !with_upper {
+            eprintln!("cbuildrt: commitUpper requires withUpper to be set");
+            return 1;
+        }
+        if !is_valid_layer_name(name) {
+            eprintln!("cbuildrt: invalid layer name '{}'", name);
+            return 1;
+        }
+        if workspace.is_temporary() {
+            eprintln!("cbuildrt: commitUpper requires a workspace");
+            return 1;
+        }
+    }
+
     if let Some(RootFs::Overlay { layers, .. }) = &cfg.rootfs {
         for layer in layers {
             if let Layer::Named(named) = layer {
@@ -960,5 +983,30 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
         run_init(&cfg, workspace, run_dir);
     }
 
-    wait_and_forward_termination(child_pid, &blocked)
+    let exit_code = wait_and_forward_termination(child_pid, &blocked);
+
+    // The overlay is gone with the mount namespace of init, so the upper dir is no longer in use.
+    if exit_code == 0 {
+        if let Some(RootFs::Overlay {
+            commit_upper: Some(name),
+            ..
+        }) = &cfg.rootfs
+        {
+            // Never replace an existing layer since containers might be using it.
+            if let Err(e) = rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &run_dir.join("upper"),
+                rustix::fs::CWD,
+                &workspace.layer_path(name),
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                eprintln!(
+                    "cbuildrt: failed to commit upper layer as '{}': {}",
+                    name, e
+                );
+                return 1;
+            }
+        }
+    }
+    exit_code
 }

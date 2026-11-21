@@ -520,3 +520,74 @@ fn named_layers() {
         .failure()
         .stderr(predicate::str::contains("invalid layer name"));
 }
+
+// Test that committed upper layers can be stacked, including whiteouts and opaque dirs.
+#[test]
+fn commit_upper() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+
+    let script_config = |layers: serde_json::Value, commit: Option<&str>, script: &str| {
+        let mut rootfs = serde_json::json!({ "layers": layers });
+        if let Some(name) = commit {
+            rootfs["withUpper"] = true.into();
+            rootfs["commitUpper"] = name.into();
+        }
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", script] },
+            "rootfs": rootfs,
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    let make_base = "mkdir d && touch d/a keep gone && chown 1:1 keep";
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("base"), make_base),
+    )
+    .success();
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!([{ "name": "base" }]),
+            Some("top"),
+            "rm gone && rm -r d && mkdir d && touch d/b",
+        ),
+    )
+    .success();
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!([{ "name": "top" }, { "name": "base" }]),
+            None,
+            r#"
+            test "$(stat -c %u:%g keep)" = 1:1
+            test ! -e gone
+            test -e d/b
+            test ! -e d/a
+            "#,
+        ),
+    )
+    .success();
+
+    // Existing layers are never replaced.
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("base"), "touch new"),
+    )
+    .failure()
+    .stderr(predicate::str::contains("failed to commit"));
+    assert!(!ws.path().join("layers/base/new").exists());
+
+    // Failing processes do not commit their upper layer.
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("failed"), "exit 3"),
+    )
+    .code(3);
+    assert!(!ws.path().join("layers/failed").exists());
+    assert_eq!(std::fs::read_dir(ws.path().join("run")).unwrap().count(), 0);
+}

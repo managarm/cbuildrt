@@ -176,6 +176,10 @@ impl Workspace {
         self.root.join("run")
     }
 
+    pub fn is_temporary(&self) -> bool {
+        self._tempdir.is_some()
+    }
+
     pub fn sub_ids(&self) -> Option<&SubIds> {
         self.sub_ids.as_ref()
     }
