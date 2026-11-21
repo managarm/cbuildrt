@@ -1,4 +1,6 @@
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
+use nix::errno::Errno;
+use nix::fcntl::FlockArg;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -37,6 +39,28 @@ enum Command {
     Purge,
     /// Manage persistent volumes in the workspace
     Volume(VolumeCommandArgs),
+    /// Manage named layers in the workspace
+    Layer(LayerCommandArgs),
+}
+
+#[derive(Args)]
+struct LayerCommandArgs {
+    #[command(subcommand)]
+    command: LayerCommand,
+}
+
+#[derive(Subcommand)]
+enum LayerCommand {
+    /// List layers in the workspace
+    Ls,
+    /// Remove a layer from the workspace unless it is in use
+    Rm(LayerRmArgs),
+}
+
+#[derive(Args)]
+struct LayerRmArgs {
+    /// Name of the layer to remove
+    name: String,
 }
 
 #[derive(Args)]
@@ -113,6 +137,9 @@ fn main() {
         }
         Some(Command::Volume(args)) => {
             do_volume_subcmd(cli.workspace.as_deref(), &args);
+        }
+        Some(Command::Layer(args)) => {
+            do_layer_subcmd(cli.workspace.as_deref(), &args);
         }
         None => {
             let cbuild_json = cli.cbuild_json.unwrap_or_else(|| {
@@ -204,6 +231,52 @@ fn do_volume_subcmd(workspace_path: Option<&Path>, args: &VolumeCommandArgs) {
             let exit_code = unsafe {
                 runtime::run_userns(&workspace, None, None, || {
                     workspace.remove_volume(&rm.name);
+                    exit(0);
+                })
+            };
+            exit(exit_code);
+        }
+    }
+}
+
+fn do_layer_subcmd(workspace_path: Option<&Path>, args: &LayerCommandArgs) {
+    let workspace_path = workspace_path.unwrap_or_else(|| {
+        Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--workspace is required for layer",
+            )
+            .exit();
+    });
+    let workspace = Workspace::load(workspace_path);
+    match &args.command {
+        LayerCommand::Ls => {
+            for name in workspace.list_layers() {
+                println!("{}", name);
+            }
+        }
+        LayerCommand::Rm(rm) => {
+            if !workspace::is_valid_layer_name(&rm.name) {
+                Cli::command()
+                    .error(
+                        ErrorKind::InvalidValue,
+                        format!("invalid layer name '{}'", rm.name),
+                    )
+                    .exit();
+            }
+            let exit_code = unsafe {
+                runtime::run_userns(&workspace, None, None, || {
+                    // Lock inside the user namespace (see runtime::run()).
+                    match workspace.lock_layer(&rm.name, FlockArg::LockExclusiveNonblock) {
+                        // The lock is held until the layer is gone.
+                        Ok(Some(_lock)) => workspace.remove_layer(&rm.name),
+                        Ok(None) => {}
+                        Err(Errno::EWOULDBLOCK) => {
+                            eprintln!("cbuildrt: layer '{}' is in use", rm.name);
+                            exit(1);
+                        }
+                        Err(e) => panic!("failed to lock layer: {}", e),
+                    }
                     exit(0);
                 })
             };

@@ -591,3 +591,116 @@ fn commit_upper() {
     assert!(!ws.path().join("layers/failed").exists());
     assert_eq!(std::fs::read_dir(ws.path().join("run")).unwrap().count(), 0);
 }
+
+// Test that layers can be listed and removed (including subordinate ID contents) unless in use.
+#[test]
+fn layer_ls_rm() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+    run_in_workspace(
+        ws.path(),
+        &serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", "touch hello && chown 1:1 hello"] },
+            "rootfs": {
+                "layers": [lower.path()],
+                "withUpper": true,
+                "commitUpper": "layer",
+            },
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        }),
+    )
+    .success();
+
+    let layer_cmd = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("cbuildrt").unwrap();
+        cmd.arg("--workspace")
+            .arg(ws.path())
+            .arg("layer")
+            .args(args);
+        cmd.assert()
+    };
+    layer_cmd(&["ls"]).success().stdout("layer\n");
+
+    // Containers lock the directory of the layer while they use it.
+    let layer_dir = std::fs::File::open(ws.path().join("layers/layer")).unwrap();
+    rustix::fs::flock(&layer_dir, rustix::fs::FlockOperation::LockShared).unwrap();
+    layer_cmd(&["rm", "layer"])
+        .failure()
+        .stderr(predicate::str::contains("in use"));
+    assert!(ws.path().join("layers/layer/hello").exists());
+    drop(layer_dir);
+
+    layer_cmd(&["rm", "layer"]).success();
+    layer_cmd(&["ls"]).success().stdout("");
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        0
+    );
+
+    // Removing a non-existent layer succeeds but invalid names are rejected.
+    layer_cmd(&["rm", "layer"]).success();
+    layer_cmd(&["rm", ".."]).failure();
+    layer_cmd(&["rm", ".trash-layer"]).failure();
+}
+
+// Test that layers are locked inside the user namespace: their directories are not necessarily
+// accessible from outside.
+#[test]
+fn inaccessible_layer() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+
+    let script_config = |rootfs: serde_json::Value, script: &str| {
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", script] },
+            "rootfs": rootfs,
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!({
+                "layers": [lower.path()],
+                "withUpper": true,
+                "commitUpper": "private",
+            }),
+            "echo world > hello && chown 1:1 . && chmod 700 .",
+        ),
+    )
+    .success();
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(ws.path().join("layers/private")).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert_ne!(meta.uid(), rustix::process::geteuid().as_raw());
+    }
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!({ "layers": [{ "name": "private" }], "withUpper": true }),
+            "cat hello",
+        ),
+    )
+    .success()
+    .stdout("world\n");
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .args(["layer", "rm", "private"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        0
+    );
+}

@@ -197,6 +197,37 @@ impl Workspace {
         }
     }
 
+    pub fn list_layers(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.layers_dir()).expect("failed to read layers directory") {
+            let entry = entry.expect("failed to read directory entry");
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if is_valid_layer_name(name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    // Like remove_volume(), this must be called from inside the workspace's user namespace.
+    pub fn remove_layer(&self, name: &str) {
+        let path = self.layer_path(name);
+        if !path.exists() {
+            return;
+        }
+        // Move the layer out of the way first such that it never becomes visible half-removed.
+        let trash = tempfile::Builder::new()
+            .prefix(".trash-")
+            .tempdir_in(self.layers_dir())
+            .expect("failed to create trash directory");
+        fs::rename(&path, trash.path().join(name)).expect("failed to move layer to trash");
+        fs::remove_dir_all(trash.keep()).expect("failed to remove layer directory");
+    }
+
     pub fn list_volumes(&self) -> Vec<String> {
         let volumes_dir = self.volumes_dir();
         let mut names = Vec::new();
