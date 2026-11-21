@@ -450,3 +450,73 @@ fn run_unknown_volume_field() {
         .failure()
         .stderr(predicate::str::contains("unknown field"));
 }
+
+fn init_workspace() -> tempfile::TempDir {
+    let ws = tempfile::tempdir().unwrap();
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+    ws
+}
+
+fn run_in_workspace(
+    ws: &std::path::Path,
+    config: &serde_json::Value,
+) -> assert_cmd::assert::Assert {
+    let f = write_config(config);
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws)
+        .arg("run")
+        .arg(f.path())
+        .assert()
+}
+
+// Test that layers can be referenced by their name in the workspace.
+#[test]
+fn named_layers() {
+    let ws = init_workspace();
+    std::fs::create_dir(ws.path().join("layers/base")).unwrap();
+    std::fs::write(ws.path().join("layers/base/hello"), "world\n").unwrap();
+
+    let cat_config = |layer: &str| {
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["cat", "hello"] },
+            "rootfs": {
+                "layers": [{ "name": layer }],
+                "withUpper": true,
+            },
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    run_in_workspace(ws.path(), &cat_config("base"))
+        .success()
+        .stdout("world\n");
+    run_in_workspace(ws.path(), &cat_config("missing"))
+        .failure()
+        .stderr(predicate::str::contains("does not exist"));
+    // Containers do not wait for layers that are locked for removal.
+    let base_dir = std::fs::File::open(ws.path().join("layers/base")).unwrap();
+    rustix::fs::flock(&base_dir, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    run_in_workspace(ws.path(), &cat_config("base"))
+        .failure()
+        .stderr(predicate::str::contains("is being removed"));
+    drop(base_dir);
+    // Layers are locked through their directories, so nothing but the layer itself exists.
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        1
+    );
+    run_in_workspace(ws.path(), &cat_config(".tmp-base"))
+        .failure()
+        .stderr(predicate::str::contains("invalid layer name"));
+}
