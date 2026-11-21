@@ -304,9 +304,10 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
                     .expect("failed to set overlay upperdir option");
                 rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
                     .expect("failed to set overlay workdir option");
-                rustix::mount::fsconfig_set_flag(&mount, "userxattr")
-                    .expect("failed to set overlay userxattr option");
             }
+            // Lower layers that were upper layers before store opaque dirs in user.overlay.* xattrs.
+            rustix::mount::fsconfig_set_flag(&mount, "userxattr")
+                .expect("failed to set overlay userxattr option");
 
             rustix::mount::fsconfig_create(&mount).expect("failed to create overlay filesystem");
 
