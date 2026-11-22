@@ -17,7 +17,7 @@ use crate::util::{
     classify_archive, open_tar_reader, open_tar_writer, termination_signal_set, ArchiveKind,
     SignalMaskGuard,
 };
-use crate::workspace::Workspace;
+use crate::workspace::{is_valid_layer_name, Workspace};
 
 #[derive(Serialize, Deserialize)]
 struct BindMount {
@@ -48,17 +48,34 @@ struct Process {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedLayer {
+    name: String,
+}
+
+// Layers are either paths (directories or tar files) or names of layers in the workspace.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Layer {
+    Path(PathBuf),
+    Named(NamedLayer),
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum RootFs {
     Path(PathBuf),
     Overlay {
-        layers: Vec<PathBuf>,
+        layers: Vec<Layer>,
         #[serde(default, rename = "withUpper")]
         with_upper: bool,
         #[serde(default, rename = "extractUpper")]
         extract_upper: Option<PathBuf>,
         #[serde(default, rename = "importUpper")]
         import_upper: Option<PathBuf>,
+        // Name of a workspace layer that the upper layer becomes if the process succeeds.
+        #[serde(default, rename = "commitUpper")]
+        commit_upper: Option<String>,
     },
 }
 
@@ -269,7 +286,10 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
 
             let resolved_layers: Vec<PathBuf> = layers
                 .iter()
-                .map(|p| resolve_tar_layer(workspace, p))
+                .map(|layer| match layer {
+                    Layer::Path(p) => resolve_tar_layer(workspace, p),
+                    Layer::Named(named) => workspace.layer_path(&named.name),
+                })
                 .collect();
 
             let mount =
@@ -304,9 +324,10 @@ fn run_init(cfg: &Config, workspace: &Workspace, run_dir: &Path) -> ! {
                     .expect("failed to set overlay upperdir option");
                 rustix::mount::fsconfig_set_string(&mount, "workdir", &work)
                     .expect("failed to set overlay workdir option");
-                rustix::mount::fsconfig_set_flag(&mount, "userxattr")
-                    .expect("failed to set overlay userxattr option");
             }
+            // Lower layers that were upper layers before store opaque dirs in user.overlay.* xattrs.
+            rustix::mount::fsconfig_set_flag(&mount, "userxattr")
+                .expect("failed to set overlay userxattr option");
 
             rustix::mount::fsconfig_create(&mount).expect("failed to create overlay filesystem");
 
@@ -848,6 +869,37 @@ pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
         None
     };
 
+    if let Some(RootFs::Overlay {
+        with_upper,
+        commit_upper: Some(name),
+        ..
+    }) = &cfg.rootfs
+    {
+        if !with_upper {
+            eprintln!("cbuildrt: commitUpper requires withUpper to be set");
+            return 1;
+        }
+        if !is_valid_layer_name(name) {
+            eprintln!("cbuildrt: invalid layer name '{}'", name);
+            return 1;
+        }
+        if workspace.is_temporary() {
+            eprintln!("cbuildrt: commitUpper requires a workspace");
+            return 1;
+        }
+    }
+
+    if let Some(RootFs::Overlay { layers, .. }) = &cfg.rootfs {
+        for layer in layers {
+            if let Layer::Named(named) = layer {
+                if !is_valid_layer_name(&named.name) {
+                    eprintln!("cbuildrt: invalid layer name '{}'", named.name);
+                    return 1;
+                }
+            }
+        }
+    }
+
     let map_to = cfg.map_current_user_to.as_ref().unwrap_or(&cfg.user);
     unsafe {
         run_userns(
@@ -855,6 +907,30 @@ pub unsafe fn run(cfg: Config, workspace: Workspace) -> i32 {
             Some(map_to.uid as u64),
             Some(map_to.gid as u64),
             || {
+                // Lock inside the user namespace since layers are not necessarily accessible
+                // from outside. The supervisor holds the locks until the container exits.
+                let mut _layer_locks = Vec::new();
+                if let Some(RootFs::Overlay { layers, .. }) = &cfg.rootfs {
+                    for layer in layers {
+                        let Layer::Named(named) = layer else {
+                            continue;
+                        };
+                        match workspace.lock_layer(&named.name, FlockArg::LockSharedNonblock) {
+                            Ok(Some(lock)) => _layer_locks.push(lock),
+                            Ok(None) => {
+                                eprintln!("cbuildrt: layer '{}' does not exist", named.name);
+                                exit(1);
+                            }
+                            // Do not wait for the removal: signals are not forwarded to us yet.
+                            Err(nix::errno::Errno::EWOULDBLOCK) => {
+                                eprintln!("cbuildrt: layer '{}' is being removed", named.name);
+                                exit(1);
+                            }
+                            Err(e) => panic!("failed to lock layer: {}", e),
+                        }
+                    }
+                }
+
                 let exit_code = run_supervisor(cfg, &workspace);
                 exit(exit_code);
             },
@@ -907,5 +983,30 @@ unsafe fn run_supervisor(cfg: Config, workspace: &Workspace) -> i32 {
         run_init(&cfg, workspace, run_dir);
     }
 
-    wait_and_forward_termination(child_pid, &blocked)
+    let exit_code = wait_and_forward_termination(child_pid, &blocked);
+
+    // The overlay is gone with the mount namespace of init, so the upper dir is no longer in use.
+    if exit_code == 0 {
+        if let Some(RootFs::Overlay {
+            commit_upper: Some(name),
+            ..
+        }) = &cfg.rootfs
+        {
+            // Never replace an existing layer since containers might be using it.
+            if let Err(e) = rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &run_dir.join("upper"),
+                rustix::fs::CWD,
+                &workspace.layer_path(name),
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                eprintln!(
+                    "cbuildrt: failed to commit upper layer as '{}': {}",
+                    name, e
+                );
+                return 1;
+            }
+        }
+    }
+    exit_code
 }

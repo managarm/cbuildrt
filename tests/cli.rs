@@ -450,3 +450,257 @@ fn run_unknown_volume_field() {
         .failure()
         .stderr(predicate::str::contains("unknown field"));
 }
+
+fn init_workspace() -> tempfile::TempDir {
+    let ws = tempfile::tempdir().unwrap();
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .arg("init")
+        .assert()
+        .success();
+    ws
+}
+
+fn run_in_workspace(
+    ws: &std::path::Path,
+    config: &serde_json::Value,
+) -> assert_cmd::assert::Assert {
+    let f = write_config(config);
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws)
+        .arg("run")
+        .arg(f.path())
+        .assert()
+}
+
+// Test that layers can be referenced by their name in the workspace.
+#[test]
+fn named_layers() {
+    let ws = init_workspace();
+    std::fs::create_dir(ws.path().join("layers/base")).unwrap();
+    std::fs::write(ws.path().join("layers/base/hello"), "world\n").unwrap();
+
+    let cat_config = |layer: &str| {
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["cat", "hello"] },
+            "rootfs": {
+                "layers": [{ "name": layer }],
+                "withUpper": true,
+            },
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    run_in_workspace(ws.path(), &cat_config("base"))
+        .success()
+        .stdout("world\n");
+    run_in_workspace(ws.path(), &cat_config("missing"))
+        .failure()
+        .stderr(predicate::str::contains("does not exist"));
+    // Containers do not wait for layers that are locked for removal.
+    let base_dir = std::fs::File::open(ws.path().join("layers/base")).unwrap();
+    rustix::fs::flock(&base_dir, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    run_in_workspace(ws.path(), &cat_config("base"))
+        .failure()
+        .stderr(predicate::str::contains("is being removed"));
+    drop(base_dir);
+    // Layers are locked through their directories, so nothing but the layer itself exists.
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        1
+    );
+    run_in_workspace(ws.path(), &cat_config(".tmp-base"))
+        .failure()
+        .stderr(predicate::str::contains("invalid layer name"));
+}
+
+// Test that committed upper layers can be stacked, including whiteouts and opaque dirs.
+#[test]
+fn commit_upper() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+
+    let script_config = |layers: serde_json::Value, commit: Option<&str>, script: &str| {
+        let mut rootfs = serde_json::json!({ "layers": layers });
+        if let Some(name) = commit {
+            rootfs["withUpper"] = true.into();
+            rootfs["commitUpper"] = name.into();
+        }
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", script] },
+            "rootfs": rootfs,
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    let make_base = "mkdir d && touch d/a keep gone && chown 1:1 keep";
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("base"), make_base),
+    )
+    .success();
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!([{ "name": "base" }]),
+            Some("top"),
+            "rm gone && rm -r d && mkdir d && touch d/b",
+        ),
+    )
+    .success();
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!([{ "name": "top" }, { "name": "base" }]),
+            None,
+            r#"
+            test "$(stat -c %u:%g keep)" = 1:1
+            test ! -e gone
+            test -e d/b
+            test ! -e d/a
+            "#,
+        ),
+    )
+    .success();
+
+    // Existing layers are never replaced.
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("base"), "touch new"),
+    )
+    .failure()
+    .stderr(predicate::str::contains("failed to commit"));
+    assert!(!ws.path().join("layers/base/new").exists());
+
+    // Failing processes do not commit their upper layer.
+    run_in_workspace(
+        ws.path(),
+        &script_config(serde_json::json!([lower.path()]), Some("failed"), "exit 3"),
+    )
+    .code(3);
+    assert!(!ws.path().join("layers/failed").exists());
+    assert_eq!(std::fs::read_dir(ws.path().join("run")).unwrap().count(), 0);
+}
+
+// Test that layers can be listed and removed (including subordinate ID contents) unless in use.
+#[test]
+fn layer_ls_rm() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+    run_in_workspace(
+        ws.path(),
+        &serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", "touch hello && chown 1:1 hello"] },
+            "rootfs": {
+                "layers": [lower.path()],
+                "withUpper": true,
+                "commitUpper": "layer",
+            },
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        }),
+    )
+    .success();
+
+    let layer_cmd = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("cbuildrt").unwrap();
+        cmd.arg("--workspace")
+            .arg(ws.path())
+            .arg("layer")
+            .args(args);
+        cmd.assert()
+    };
+    layer_cmd(&["ls"]).success().stdout("layer\n");
+
+    // Containers lock the directory of the layer while they use it.
+    let layer_dir = std::fs::File::open(ws.path().join("layers/layer")).unwrap();
+    rustix::fs::flock(&layer_dir, rustix::fs::FlockOperation::LockShared).unwrap();
+    layer_cmd(&["rm", "layer"])
+        .failure()
+        .stderr(predicate::str::contains("in use"));
+    assert!(ws.path().join("layers/layer/hello").exists());
+    drop(layer_dir);
+
+    layer_cmd(&["rm", "layer"]).success();
+    layer_cmd(&["ls"]).success().stdout("");
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        0
+    );
+
+    // Removing a non-existent layer succeeds but invalid names are rejected.
+    layer_cmd(&["rm", "layer"]).success();
+    layer_cmd(&["rm", ".."]).failure();
+    layer_cmd(&["rm", ".trash-layer"]).failure();
+}
+
+// Test that layers are locked inside the user namespace: their directories are not necessarily
+// accessible from outside.
+#[test]
+fn inaccessible_layer() {
+    let ws = init_workspace();
+    let lower = tempfile::tempdir().unwrap();
+
+    let script_config = |rootfs: serde_json::Value, script: &str| {
+        serde_json::json!({
+            "user": { "uid": 0, "gid": 0 },
+            "process": { "args": ["sh", "-ec", script] },
+            "rootfs": rootfs,
+            "noChroot": true,
+            "noSystemMounts": true,
+            "bindMounts": [],
+        })
+    };
+
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!({
+                "layers": [lower.path()],
+                "withUpper": true,
+                "commitUpper": "private",
+            }),
+            "echo world > hello && chown 1:1 . && chmod 700 .",
+        ),
+    )
+    .success();
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(ws.path().join("layers/private")).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert_ne!(meta.uid(), rustix::process::geteuid().as_raw());
+    }
+    run_in_workspace(
+        ws.path(),
+        &script_config(
+            serde_json::json!({ "layers": [{ "name": "private" }], "withUpper": true }),
+            "cat hello",
+        ),
+    )
+    .success()
+    .stdout("world\n");
+
+    Command::cargo_bin("cbuildrt")
+        .unwrap()
+        .arg("--workspace")
+        .arg(ws.path())
+        .args(["layer", "rm", "private"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_dir(ws.path().join("layers")).unwrap().count(),
+        0
+    );
+}

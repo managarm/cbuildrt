@@ -11,7 +11,7 @@ edition = "2018"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "mount", "process", "sched", "signal", "user"] }
-rustix = { version = "1.1.3", features = ["event", "mount", "net", "process"] }
+rustix = { version = "1.1.3", features = ["event", "fs", "mount", "net", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tar = "0.4"

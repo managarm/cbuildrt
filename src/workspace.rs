@@ -1,5 +1,7 @@
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -121,6 +123,44 @@ impl Workspace {
         self.root.join("layers")
     }
 
+    pub fn layer_path(&self, name: &str) -> PathBuf {
+        if !is_valid_layer_name(name) {
+            panic!("invalid layer name '{}'", name);
+        }
+        self.layers_dir().join(name)
+    }
+
+    // Containers hold a shared lock on the directory of each named layer that they use, removal
+    // takes it exclusively. Returns None if the layer does not exist.
+    pub fn lock_layer(&self, name: &str, arg: FlockArg) -> nix::Result<Option<Flock<fs::File>>> {
+        let path = self.layer_path(name);
+        let is_missing = |e: &std::io::Error| {
+            matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+        };
+        loop {
+            let dir = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(&path)
+            {
+                Ok(dir) => dir,
+                Err(e) if is_missing(&e) => return Ok(None),
+                Err(e) => panic!("failed to open {}: {}", path.display(), e),
+            };
+            let lock = Flock::lock(dir, arg).map_err(|(_, e)| e)?;
+            // The layer could have been removed (and committed again) before we got the lock.
+            let locked = lock.metadata().expect("failed to stat locked layer");
+            match fs::metadata(&path) {
+                Ok(current) if (current.dev(), current.ino()) == (locked.dev(), locked.ino()) => {
+                    return Ok(Some(lock));
+                }
+                Ok(_) => continue,
+                Err(e) if is_missing(&e) => return Ok(None),
+                Err(e) => panic!("failed to stat {}: {}", path.display(), e),
+            }
+        }
+    }
+
     pub fn volumes_dir(&self) -> PathBuf {
         self.root.join("volumes")
     }
@@ -134,6 +174,10 @@ impl Workspace {
 
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
+    }
+
+    pub fn is_temporary(&self) -> bool {
+        self._tempdir.is_some()
     }
 
     pub fn sub_ids(&self) -> Option<&SubIds> {
@@ -151,6 +195,37 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    pub fn list_layers(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.layers_dir()).expect("failed to read layers directory") {
+            let entry = entry.expect("failed to read directory entry");
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if is_valid_layer_name(name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    // Like remove_volume(), this must be called from inside the workspace's user namespace.
+    pub fn remove_layer(&self, name: &str) {
+        let path = self.layer_path(name);
+        if !path.exists() {
+            return;
+        }
+        // Move the layer out of the way first such that it never becomes visible half-removed.
+        let trash = tempfile::Builder::new()
+            .prefix(".trash-")
+            .tempdir_in(self.layers_dir())
+            .expect("failed to create trash directory");
+        fs::rename(&path, trash.path().join(name)).expect("failed to move layer to trash");
+        fs::remove_dir_all(trash.keep()).expect("failed to remove layer directory");
     }
 
     pub fn list_volumes(&self) -> Vec<String> {
@@ -184,6 +259,14 @@ impl Workspace {
 // Volume names must not escape the volumes directory.
 pub fn is_valid_volume_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('/') && name != "." && name != ".."
+}
+
+// Hidden names are reserved for extraction and removal in progress.
+pub fn is_valid_layer_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.starts_with('.')
+        && !name.contains(".cbrt_lock")
 }
 
 fn parse_subordinate_file(path: &str, username: &str) -> (u64, u64) {
